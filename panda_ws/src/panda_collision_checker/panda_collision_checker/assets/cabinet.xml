@@ -1,0 +1,81 @@
+<mujoco model="brown_cabinet">
+
+    <asset>
+        <material
+            name="brown_wood"
+            rgba="0.35 0.16 0.06 1"
+            specular="0.2"
+            shininess="0.3"/>
+    </asset>
+
+    <worldbody>
+        <body>
+            <body name="object">
+                <!-- Back panel -->
+                <geom
+                    name="back"
+                    type="box"
+                    size="0.15 0.015 0.175"
+                    pos="0 0.135 0.175"
+                    material="brown_wood"
+                    group="0"/>
+
+                <!-- Left side -->
+                <geom
+                    name="left"
+                    type="box"
+                    size="0.015 0.15 0.175"
+                    pos="-0.165 0 0.175"
+                    material="brown_wood"
+                    group="0"/>
+
+                <!-- Right side -->
+                <geom
+                    name="right"
+                    type="box"
+                    size="0.015 0.15 0.175"
+                    pos="0.165 0 0.175"
+                    material="brown_wood"
+                    group="0"/>
+
+                <!-- Bottom -->
+                <geom
+                    name="bottom"
+                    type="box"
+                    size="0.165 0.15 0.015"
+                    pos="0 0 0.015"
+                    material="brown_wood"
+                    group="0"/>
+
+                <!-- Top -->
+                <geom
+                    name="top"
+                    type="box"
+                    size="0.165 0.15 0.015"
+                    pos="0 0 0.335"
+                    material="brown_wood"
+                    group="0"/>
+
+                <!-- Shelf 1 -->
+                <geom
+                    name="shelf_1"
+                    type="box"
+                    size="0.15 0.135 0.012"
+                    pos="0 0 0.165"
+                    material="brown_wood"
+                    group="0"/>
+
+                <!-- Shelf 2 -->
+                <!-- <geom
+                    name="shelf_2"
+                    type="box"
+                    size="0.15 0.135 0.012"
+                    pos="0 0 0.225"
+                    material="brown_wood"
+                    group="0"/> -->
+
+            </body>
+        </body>
+    </worldbody>
+
+</mujoco>
