@@ -112,5 +112,5 @@ class CollisionChecker:
                     f"{geom1_name} <-> {geom2_name}"
                 )
                 return True
-
+        print("No collision detected.")
         return False

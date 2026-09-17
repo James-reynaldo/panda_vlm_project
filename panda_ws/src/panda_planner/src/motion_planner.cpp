@@ -1,7 +1,14 @@
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>   
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
+
+#include <array>
+#include <chrono>
+#include <future>
+
+#include "panda_interfaces/srv/collision_check.hpp"
 
 #include "panda_planner/Eigen/Dense"
 #include "panda_planner/Eigen/Geometry"
@@ -146,11 +153,60 @@ public:
         T_world_base_.translation() = Eigen::Vector3d(PANDA_BASE_X, PANDA_BASE_Y, PANDA_BASE_Z);
         T_world_base_.linear() = Eigen::Quaterniond(PANDA_BASE_QW, PANDA_BASE_QX, PANDA_BASE_QY, PANDA_BASE_QZ).toRotationMatrix();
 
+        collision_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+
         grasp_subscriber_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "grasp_pose", 10, std::bind(&MotionPlanner::graspCallback, this, std::placeholders::_1));
         joint_subscriber_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "panda_joint_states", 10, std::bind(&MotionPlanner::jointCallback, this, std::placeholders::_1));
         trajectory_publisher_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("joint_trajectory", 10);
+        collision_checker_client_ = this->create_client<panda_interfaces::srv::CollisionCheck>(
+            "/collision_check",
+            rmw_qos_profile_services_default,
+            collision_callback_group_);
+
+        collision_service_available_ = collision_checker_client_->wait_for_service(std::chrono::seconds(5));
+        if (!collision_service_available_) {
+            RCLCPP_ERROR(this->get_logger(), "Collision checker service '/collision_check' is unavailable during initialization.");
+        } else {
+            RCLCPP_INFO(this->get_logger(), "Collision checker service '/collision_check' available.");
+        }
+    }
+
+    bool checkCollision(const std::array<double, 7>& q)
+    {
+        if (!collision_checker_client_) {
+            RCLCPP_ERROR(this->get_logger(), "Collision checker service client is unavailable.");
+            return false;
+        }
+
+        if (!collision_service_available_) {
+            RCLCPP_ERROR(this->get_logger(), "Collision checker service '/collision_check' was not available at startup.");
+            return false;
+        }
+
+        auto request = std::make_shared<panda_interfaces::srv::CollisionCheck::Request>();
+        request->joint_positions.assign(q.begin(), q.end());
+
+        auto future = collision_checker_client_->async_send_request(request);
+        if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+            RCLCPP_ERROR(this->get_logger(), "Collision checker service call timed out for joint configuration.");
+            return false;
+        }
+
+        try {
+            auto response = future.get();
+            if (!response->collision_free) {
+                RCLCPP_WARN(this->get_logger(), "Collision detected for q = [%f, %f, %f, %f, %f, %f, %f]",
+                            q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
+                return false;
+            }
+
+            return true;
+        } catch (const std::exception& ex) {
+            RCLCPP_ERROR(this->get_logger(), "Collision checker service call failed: %s", ex.what());
+            return false;
+        }
     }
 
 private:
@@ -184,24 +240,23 @@ private:
         // Further processing, such as calling the IK solver, can be done here    
 
         // call the IK solver with the computed T_base_grasp and current joint states
-        std::array<double, 7> q_actual = {
-        0.0,
-        1.0,
-        0.0,
-        -1.0,
-        0.0,
-        1.5,
-        0.0
-    };
-
         std::vector<std::array<double, 7>> q_solution;
-        if (solvePandaIK(T_base_grasp, q_actual, q_solution))
+        if (solvePandaIK(T_base_grasp, current_joint_states_, q_solution))
         {
+            const auto& candidate = q_solution[0];
             RCLCPP_INFO(this->get_logger(), "IK solution found: [%f, %f, %f, %f, %f, %f, %f]", 
-                        q_solution[0][0], q_solution[0][1], q_solution[0][2], q_solution[0][3], q_solution[0][4], q_solution[0][5], q_solution[0][6]);
+                        candidate[0], candidate[1], candidate[2], candidate[3], candidate[4], candidate[5], candidate[6]);
+
+            if (checkCollision(candidate)) {
+                RCLCPP_INFO(this->get_logger(), "IK solution is collision-free.");
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Discarding IK solution because it is in collision or the service check failed.");
+            }
+
             // Publish the joint trajectory
             trajectory_msgs::msg::JointTrajectory trajectory_msg;
         }
+
     }
     void jointCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
     {
@@ -216,6 +271,9 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr grasp_subscriber_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_subscriber_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr trajectory_publisher_;
+    rclcpp::CallbackGroup::SharedPtr collision_callback_group_;
+    rclcpp::Client<panda_interfaces::srv::CollisionCheck>::SharedPtr collision_checker_client_;
+    bool collision_service_available_{false};
 
     Eigen::Isometry3d T_world_base_;
     std::array<double, 7> current_joint_states_;
@@ -226,7 +284,11 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<MotionPlanner>();
-    rclcpp::spin(node);
+
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
+
     rclcpp::shutdown();
     return 0;
 }
