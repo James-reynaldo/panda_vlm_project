@@ -97,7 +97,7 @@ int main()
     // ============================================================
 
     Eigen::Vector3d grasp_position_world(
-        -0.2,  -0.1,   0.82
+        -0.2,  -0.1,   0.85
     );
     // Eigen::Vector3d grasp_position_world(
     //     0.0,
@@ -174,7 +174,16 @@ int main()
 
     std::array<double, 16> O_T_EE =
         toIKMatrix(T_base_grasp);
-
+    
+    printf("O_T_EE:\n");
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            printf("% .6f ", O_T_EE[j * 4 + i]);
+        }
+        printf("\n");
+    }
     // std::array<double, 16> O_T_EE = {
     //     // column 1 (+X)
     //     1.0,

@@ -1,0 +1,8 @@
+.venv-ros/
+build/
+install/
+log/
+panda_ws/build/
+panda_ws/install/
+panda_ws/log/
+__pycache__/

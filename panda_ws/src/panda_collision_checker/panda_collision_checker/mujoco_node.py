@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import JointState
 
 import numpy as np
 from panda_collision_checker.Panda_scene import PandaScene
@@ -24,8 +25,10 @@ class MujocoNode(Node):
         self.get_logger().info(f"Cube ID: {self.cube_id}")
         self.cube_pose_publisher = self.create_publisher(PoseStamped, 'cube_pose', 10)
         self.panda_base_pose_publisher = self.create_publisher(PoseStamped, 'panda_base_pose', 10)
+        self.panda_joint_state_publisher = self.create_publisher(JointState, 'panda_joint_states', 10)
         self.cube_timer = self.create_timer(0.1, self.publish_cube_pose)
         self.panda_base_timer = self.create_timer(0.1, self.publish_panda_base_pose)
+        self.panda_joint_state_timer = self.create_timer(0.1, self.publish_panda_joint_states)
 
     def publish_cube_pose(self):
         # Example pose data; replace with actual data from MuJoCo
@@ -69,6 +72,14 @@ class MujocoNode(Node):
 
         self.panda_base_pose_publisher.publish(pose_msg)
 
+    def publish_panda_joint_states(self):
+        joint_state_msg = JointState()
+        joint_state_msg.header.stamp = self.get_clock().now().to_msg()
+        joint_state_msg.header.frame_id = "world"
+        joint_state_msg.name = [f"robot0_joint{i+1}" for i in range(7)]
+        joint_state_msg.position = self.env.sim.data.qpos[:7].tolist()  # Assuming the first 7 qpos are the joint positions
+
+        self.panda_joint_state_publisher.publish(joint_state_msg)
     @staticmethod
     def rotation_matrix_to_quaternion(R):
 
