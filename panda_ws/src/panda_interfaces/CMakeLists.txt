@@ -10,8 +10,13 @@ find_package(ament_cmake REQUIRED)
 # uncomment the following section in order to fill in
 # further dependencies manually.
 find_package(rosidl_default_generators REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
+
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/CollisionCheck.srv"
+  "srv/PlanMotion.srv"
+  DEPENDENCIES geometry_msgs trajectory_msgs
 )
 
 if(BUILD_TESTING)

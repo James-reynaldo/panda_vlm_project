@@ -7,6 +7,12 @@
 #include <array>
 #include <chrono>
 #include <future>
+#include <string>
+#include <vector>
+
+#include <ompl/base/spaces/RealVectorStateSpace.h>
+#include <ompl/geometric/SimpleSetup.h>
+#include <ompl/geometric/planners/rrt/RRTConnect.h>
 
 #include "panda_interfaces/srv/collision_check.hpp"
 
@@ -14,8 +20,10 @@
 #include "panda_planner/Eigen/Geometry"
 
 #include "panda_planner/franka_ik_He.hpp"
+#include "panda_interfaces/srv/plan_motion.hpp"
 
 constexpr double HAND_OFFSET = -0.107;
+constexpr double OMPL_PLANNING_TIME = 10.0;
 
 static constexpr double PANDA_BASE_X = 0.0;
 static constexpr double PANDA_BASE_Y = -0.65;
@@ -25,6 +33,19 @@ static constexpr double PANDA_BASE_QW = 0.70710678;
 static constexpr double PANDA_BASE_QX = 0.0;
 static constexpr double PANDA_BASE_QY = 0.0;
 static constexpr double PANDA_BASE_QZ = 0.70710678;
+
+static constexpr std::array<double, 7> PANDA_JOINT_LIMITS_LOW = {
+    -2.7473, -1.6728, -2.7473, -2.9218, -2.7473, -0.0775, -2.7473
+};
+
+static constexpr std::array<double, 7> PANDA_JOINT_LIMITS_HIGH = {
+    2.7473, 1.6728, 2.7473, -0.2198, 2.7473, 3.6025, 2.7473
+};
+
+static constexpr std::array<const char*, 7> PANDA_JOINT_NAMES = {
+    "panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4",
+    "panda_joint5", "panda_joint6", "panda_joint7"
+};
 
 Eigen::Isometry3d transformToPandaBase(
     const Eigen::Vector3d& position_world,
@@ -102,6 +123,18 @@ std::array<double, 16> toIKMatrix(
     return result;
 }
 
+bool isWithinJointLimits(const std::array<double, 7>& q)
+{
+    for (std::size_t i = 0; i < 7; ++i)
+    {
+        if (q[i] < PANDA_JOINT_LIMITS_LOW[i] || q[i] > PANDA_JOINT_LIMITS_HIGH[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool solvePandaIK(
     const Eigen::Isometry3d& T_base_grasp,
     const std::array<double, 7>& q_actual,
@@ -136,6 +169,9 @@ bool solvePandaIK(
             if (!valid)
                 continue;
 
+            if (!isWithinJointLimits(solution))
+                continue;
+
             q_solution.push_back(solution);
             return true;
         }
@@ -155,8 +191,6 @@ public:
 
         collision_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
-        grasp_subscriber_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-            "grasp_pose", 10, std::bind(&MotionPlanner::graspCallback, this, std::placeholders::_1));
         joint_subscriber_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "panda_joint_states", 10, std::bind(&MotionPlanner::jointCallback, this, std::placeholders::_1));
         trajectory_publisher_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("joint_trajectory", 10);
@@ -164,6 +198,16 @@ public:
             "/collision_check",
             rmw_qos_profile_services_default,
             collision_callback_group_);
+        plan_motion_server_ = this->create_service<panda_interfaces::srv::PlanMotion>(
+            "/plan_motion",
+            std::bind(&MotionPlanner::handlePlanMotion, this, std::placeholders::_1, std::placeholders::_2));
+
+        current_joint_states_.fill(0.0);
+        current_joint_names_.clear();
+        for (const char* joint_name : PANDA_JOINT_NAMES)
+        {
+            current_joint_names_.emplace_back(joint_name);
+        }
 
         collision_service_available_ = collision_checker_client_->wait_for_service(std::chrono::seconds(5));
         if (!collision_service_available_) {
@@ -209,74 +253,212 @@ public:
         }
     }
 
-private:
-    
-    void graspCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+    bool planJointTrajectory(const std::array<double, 7>& q_goal, trajectory_msgs::msg::JointTrajectory& trajectory_msg)
     {
-        RCLCPP_INFO(this->get_logger(), "Received grasp pose: position(%f, %f, %f), orientation(%f, %f, %f, %f)",
-                    msg->pose.position.x, msg->pose.position.y, msg->pose.position.z,
-                    msg->pose.orientation.x, msg->pose.orientation.y, msg->pose.orientation.z, msg->pose.orientation.w);
-        // Implement motion planning logic here
-        Eigen::Isometry3d T_world_grasp = Eigen::Isometry3d::Identity();
-        Eigen::Vector3d pos_world(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
-        Eigen::Quaterniond ori_world(msg->pose.orientation.x, msg->pose.orientation.y, msg->pose.orientation.z, msg->pose.orientation.w);
-        T_world_grasp.translation() = pos_world;
-        T_world_grasp.linear() = ori_world.toRotationMatrix();
-
-        // Use the same hand offset compensation as the IK test.
-        Eigen::Vector3d panda_base_pos = T_world_base_.translation();
-        Eigen::Quaterniond panda_base_ori(T_world_base_.linear());
-        // Pass the same HAND_OFFSET sign as in test_ik.cpp (HAND_OFFSET is negative there).
-        Eigen::Isometry3d T_base_grasp = transformToPandaBase(
-            pos_world,
-            ori_world,
-            panda_base_pos,
-            panda_base_ori,
-            HAND_OFFSET
-        );
-
-        RCLCPP_INFO(this->get_logger(), "Computed T_base_grasp: translation(%f, %f, %f)", 
-                    T_base_grasp.translation().x(), T_base_grasp.translation().y(), T_base_grasp.translation().z());
-        // Further processing, such as calling the IK solver, can be done here    
-
-        // call the IK solver with the computed T_base_grasp and current joint states
-        std::vector<std::array<double, 7>> q_solution;
-        if (solvePandaIK(T_base_grasp, current_joint_states_, q_solution))
+        if (!isWithinJointLimits(q_goal))
         {
-            const auto& candidate = q_solution[0];
-            RCLCPP_INFO(this->get_logger(), "IK solution found: [%f, %f, %f, %f, %f, %f, %f]", 
-                        candidate[0], candidate[1], candidate[2], candidate[3], candidate[4], candidate[5], candidate[6]);
+            RCLCPP_ERROR(this->get_logger(), "Goal joint configuration is outside Panda limits and cannot be used by OMPL.");
+            return false;
+        }
 
-            if (checkCollision(candidate)) {
-                RCLCPP_INFO(this->get_logger(), "IK solution is collision-free.");
-            } else {
-                RCLCPP_WARN(this->get_logger(), "Discarding IK solution because it is in collision or the service check failed.");
+        auto space = std::make_shared<ompl::base::RealVectorStateSpace>(7);
+        ompl::base::RealVectorBounds bounds(7);
+        for (std::size_t i = 0; i < 7; ++i)
+        {
+            bounds.setLow(i, PANDA_JOINT_LIMITS_LOW[i]);
+            bounds.setHigh(i, PANDA_JOINT_LIMITS_HIGH[i]);
+        }
+        space->setBounds(bounds);
+
+        ompl::geometric::SimpleSetup ss(space);
+        ss.setStateValidityChecker([this](const ompl::base::State* state) {
+            const auto* rvs = state->as<ompl::base::RealVectorStateSpace::StateType>();
+            std::array<double, 7> q{};
+            for (std::size_t i = 0; i < 7; ++i)
+            {
+                q[i] = rvs->values[i];
+            }
+            return this->checkCollision(q);
+        });
+
+        ompl::base::ScopedState<ompl::base::RealVectorStateSpace> start(space);
+        for (std::size_t i = 0; i < 7; ++i)
+        {
+            start[i] = current_joint_states_[i];
+        }
+
+        ompl::base::ScopedState<ompl::base::RealVectorStateSpace> goal(space);
+        for (std::size_t i = 0; i < 7; ++i)
+        {
+            goal[i] = q_goal[i];
+        }
+
+        ss.setStartAndGoalStates(start, goal);
+        ss.setPlanner(std::make_shared<ompl::geometric::RRTConnect>(ss.getSpaceInformation()));
+
+        const ompl::base::PlannerStatus status = ss.solve(OMPL_PLANNING_TIME);
+        if (!status)
+        {
+            RCLCPP_ERROR(this->get_logger(), "OMPL planning failed to initialize for the requested goal.");
+            return false;
+        }
+
+        if (!ss.haveSolutionPath())
+        {
+            RCLCPP_WARN(this->get_logger(), "No collision-free OMPL path found within %.1f seconds.", OMPL_PLANNING_TIME);
+            return false;
+        }
+
+        ompl::geometric::PathGeometric path = ss.getSolutionPath();
+        path.interpolate();
+
+        trajectory_msg.header.stamp = this->now();
+        trajectory_msg.header.frame_id = "world";
+        trajectory_msg.joint_names = current_joint_names_;
+        trajectory_msg.points.resize(path.getStateCount());
+
+        const double dt = path.getStateCount() > 1 ? 0.1 : 0.0;
+        for (std::size_t i = 0; i < path.getStateCount(); ++i)
+        {
+            const auto* state = path.getState(i)->as<ompl::base::RealVectorStateSpace::StateType>();
+            trajectory_msgs::msg::JointTrajectoryPoint point;
+            point.positions.resize(7);
+            point.velocities.resize(7, 0.0);
+            point.accelerations.resize(7, 0.0);
+
+            for (std::size_t j = 0; j < 7; ++j)
+            {
+                point.positions[j] = state->values[j];
             }
 
-            // Publish the joint trajectory
-            trajectory_msgs::msg::JointTrajectory trajectory_msg;
+            point.time_from_start = rclcpp::Duration::from_seconds(static_cast<double>(i) * dt);
+            trajectory_msg.points[i] = point;
         }
 
+        RCLCPP_INFO(this->get_logger(), "OMPL found a collision-free path with %zu points.", trajectory_msg.points.size());
+        return true;
     }
+
+private:
+    void handlePlanMotion(
+        const std::shared_ptr<panda_interfaces::srv::PlanMotion::Request> request,
+        std::shared_ptr<panda_interfaces::srv::PlanMotion::Response> response)
+    {
+        if (planning_in_progress_.load(std::memory_order_acquire))
+        {
+            response->success = false;
+            response->message = "Motion planning is already in progress.";
+            response->trajectory = trajectory_msgs::msg::JointTrajectory();
+            RCLCPP_WARN(this->get_logger(), "Ignoring /plan_motion request while a plan is already in progress.");
+            return;
+        }
+
+        planning_in_progress_.store(true, std::memory_order_release);
+
+        try
+        {
+            const auto& grasp_pose = request->grasp_pose;
+            RCLCPP_INFO(this->get_logger(), "Received /plan_motion request: position(%f, %f, %f), orientation(%f, %f, %f, %f)",
+                        grasp_pose.pose.position.x, grasp_pose.pose.position.y, grasp_pose.pose.position.z,
+                        grasp_pose.pose.orientation.x, grasp_pose.pose.orientation.y, grasp_pose.pose.orientation.z, grasp_pose.pose.orientation.w);
+
+            Eigen::Vector3d pos_world(grasp_pose.pose.position.x, grasp_pose.pose.position.y, grasp_pose.pose.position.z);
+            Eigen::Quaterniond ori_world(grasp_pose.pose.orientation.x, grasp_pose.pose.orientation.y, grasp_pose.pose.orientation.z, grasp_pose.pose.orientation.w);
+
+            Eigen::Isometry3d T_base_grasp = transformToPandaBase(
+                pos_world,
+                ori_world,
+                T_world_base_.translation(),
+                Eigen::Quaterniond(T_world_base_.linear()),
+                HAND_OFFSET
+            );
+
+            std::vector<std::array<double, 7>> q_solution;
+            if (!solvePandaIK(T_base_grasp, current_joint_states_, q_solution))
+            {
+                response->success = false;
+                response->message = "No IK solution found for the requested grasp pose.";
+                response->trajectory = trajectory_msgs::msg::JointTrajectory();
+                return;
+            }
+
+            const auto& candidate = q_solution[0];
+            RCLCPP_INFO(this->get_logger(), "IK solution found: [%f, %f, %f, %f, %f, %f, %f]",
+                        candidate[0], candidate[1], candidate[2], candidate[3], candidate[4], candidate[5], candidate[6]);
+
+            if (!checkCollision(candidate))
+            {
+                response->success = false;
+                response->message = "Discarding IK solution because it is in collision or the service check failed.";
+                response->trajectory = trajectory_msgs::msg::JointTrajectory();
+                return;
+            }
+
+            trajectory_msgs::msg::JointTrajectory trajectory_msg;
+            if (!planJointTrajectory(candidate, trajectory_msg))
+            {
+                response->success = false;
+                response->message = "Planning failed for the IK goal within the configured time budget.";
+                response->trajectory = trajectory_msgs::msg::JointTrajectory();
+                return;
+            }
+
+            trajectory_publisher_->publish(trajectory_msg);
+            response->success = true;
+            response->message = "Motion plan generated successfully.";
+            response->trajectory = trajectory_msg;
+            RCLCPP_INFO(this->get_logger(), "Published joint trajectory on 'joint_trajectory' and returned it via /plan_motion.");
+        }
+        catch (const std::exception& ex)
+        {
+            response->success = false;
+            response->message = std::string("Planning service failed: ") + ex.what();
+            response->trajectory = trajectory_msgs::msg::JointTrajectory();
+            RCLCPP_ERROR(this->get_logger(), "%s", response->message.c_str());
+        }
+
+        planning_in_progress_.store(false, std::memory_order_release);
+    }
+
     void jointCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
     {
-        // RCLCPP_INFO(this->get_logger(), "Received joint states: %lu joints", msg->name.size());
-        // Implement joint state handling logic here
         current_joint_states_.fill(0.0);
-        for (size_t i = 0; i < msg->name.size() && i < 7; ++i)
+        current_joint_names_.clear();
+
+        if (!msg->name.empty())
         {
-            current_joint_states_[i] = msg->position[i];
+            current_joint_names_.reserve(msg->name.size());
+            for (size_t i = 0; i < msg->name.size() && i < 7; ++i)
+            {
+                current_joint_names_.push_back(msg->name[i]);
+                current_joint_states_[i] = msg->position[i];
+            }
+        }
+
+        if (current_joint_names_.size() < 7)
+        {
+            current_joint_names_.clear();
+            for (const char* joint_name : PANDA_JOINT_NAMES)
+            {
+                current_joint_names_.emplace_back(joint_name);
+            }
+        }
+        else if (current_joint_names_.size() > 7)
+        {
+            current_joint_names_.resize(7);
         }
     }
-    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr grasp_subscriber_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_subscriber_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr trajectory_publisher_;
+    rclcpp::Service<panda_interfaces::srv::PlanMotion>::SharedPtr plan_motion_server_;
     rclcpp::CallbackGroup::SharedPtr collision_callback_group_;
     rclcpp::Client<panda_interfaces::srv::CollisionCheck>::SharedPtr collision_checker_client_;
     bool collision_service_available_{false};
+    std::atomic_bool planning_in_progress_{false};
 
     Eigen::Isometry3d T_world_base_;
-    std::array<double, 7> current_joint_states_;
+    std::array<double, 7> current_joint_states_{};
+    std::vector<std::string> current_joint_names_;
 
 };
 

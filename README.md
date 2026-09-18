@@ -1,1 +1,5 @@
 colcon build
+ros2 run panda_collision_checker mujoco_node 
+ros2 run panda_collision_checker task_planner_node
+ros2 run panda_collision_checker collision_checker_node 
+ros2 run panda_planner motion_planner 

@@ -1,0 +1,5 @@
+geometry_msgs/PoseStamped grasp_pose
+---
+bool success
+string message
+trajectory_msgs/JointTrajectory trajectory
