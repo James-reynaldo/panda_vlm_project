@@ -54,7 +54,7 @@ class PandaScene(SingleArmEnv):
             horizon=1000,
             ignore_done=True,
             hard_reset=False,
-            camera_names=None,
+            render_camera="robot0_eye_in_hand",
             camera_heights=None,
             camera_widths=None,
             camera_depths=None,

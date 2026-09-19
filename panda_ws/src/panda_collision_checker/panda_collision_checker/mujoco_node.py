@@ -4,6 +4,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory
+from std_msgs.msg import Bool
 
 import numpy as np
 from panda_collision_checker.Panda_scene import PandaScene
@@ -29,10 +30,19 @@ class MujocoNode(Node):
         self._trajectory_start = None
         self.get_logger().info(f"Cube ID: {self.cube_id}")
 
+        # Joint position tolerance for trajectory completion (radians)
+        self.position_tolerance = 0.05
+
         self.cube_pose_publisher = self.create_publisher(PoseStamped, 'cube_pose', 10)
         self.panda_base_pose_publisher = self.create_publisher(PoseStamped, 'panda_base_pose', 10)
         self.panda_joint_state_publisher = self.create_publisher(JointState, 'panda_joint_states', 10)
+        self.motion_completed_publisher = self.create_publisher(Bool, '/motion_completed', 10)
         self.trajectory_subscriber = self.create_subscription(JointTrajectory, 'joint_trajectory', self.trajectory_callback, 10)
+        self.gripper_command_subscriber = self.create_subscription(Bool, '/gripper_command', self.gripper_command_callback, 10)
+
+        # Track trajectory execution state
+        self._trajectory_completed_published = False
+        self._gripper_closed = False  # Track gripper state
 
         # Single synchronized simulation/render/publish loop
         self.sim_timer = self.create_timer(0.05, self.simulation_loop)
@@ -53,6 +63,13 @@ class MujocoNode(Node):
 
         self._trajectory = points
         self._trajectory_start = self.get_clock().now().nanoseconds * 1e-9
+        self._trajectory_completed_published = False  # Reset flag for new trajectory
+        self.get_logger().info(f"Received trajectory with {len(points)} points. Target duration: {points[-1][0]:.3f}s")
+
+    def gripper_command_callback(self, msg):
+        """Handle gripper open/close command."""
+        self._gripper_closed = msg.data
+        self.get_logger().info(f"Gripper command received: {'CLOSE' if msg.data else 'OPEN'}")
 
     def _interpolate_trajectory(self):
         if self._trajectory is None or self._trajectory_start is None:
@@ -83,25 +100,73 @@ class MujocoNode(Node):
 
     def simulation_loop(self):
         action = self._zero_action.copy()
+
+        # Arm trajectory
         trajectory_goal = self._interpolate_trajectory()
 
         if trajectory_goal is not None:
             robot = self.env.robots[0]
             current_qpos = np.asarray(robot._joint_positions, dtype=np.float64)
-            joint_delta = np.asarray(trajectory_goal, dtype=np.float64) - current_qpos
+
+            joint_delta = trajectory_goal - current_qpos
             action_dim = robot.controller.control_dim
             action[:action_dim] = joint_delta[:action_dim]
 
-        # 1) Advance the MuJoCo/robosuite simulation by one timestep.
-        self.env.step(action)
+        # Gripper command — always apply it
+        if self._gripper_closed:
+            action[7] = 1.0
+        else:
+            action[7] = -1.0
 
-        # 2) Render the environment.
+        self.env.step(action)
         self.env.render()
 
-        # 3-5) Publish state in the same loop.
+        self._check_and_publish_trajectory_completion()
+
         self.publish_cube_pose()
         self.publish_panda_base_pose()
         self.publish_panda_joint_states()
+
+    def _check_and_publish_trajectory_completion(self):
+        """Check if trajectory has finished and robot has reached target position within tolerance."""
+        if self._trajectory is None or self._trajectory_start is None:
+            return
+
+        if self._trajectory_completed_published:
+            return  # Already published for this trajectory
+
+        now = self.get_clock().now().nanoseconds * 1e-9
+        elapsed = now - self._trajectory_start
+        trajectory_duration = self._trajectory[-1][0]
+
+        # Only check for completion after trajectory time has elapsed
+        if elapsed >= trajectory_duration:
+            # Get actual joint positions from robot
+            robot = self.env.robots[0]
+            actual_qpos = np.asarray(robot._joint_positions, dtype=np.float64)
+            target_qpos = self._trajectory[-1][1]
+            
+            # Calculate absolute joint position errors
+            joint_errors = np.abs(actual_qpos - target_qpos)
+            max_error = np.max(joint_errors)
+            
+            # Check if within tolerance
+            if max_error < self.position_tolerance:
+                completion_msg = Bool(data=True)
+                self.motion_completed_publisher.publish(completion_msg)
+                self._trajectory_completed_published = True
+                self.get_logger().info(
+                    f"Trajectory execution completed. Final max joint position error: {max_error:.6f} rad "
+                    f"(tolerance: {self.position_tolerance} rad). Published /motion_completed."
+                )
+                # Clear trajectory to prevent re-publishing
+                self._trajectory = None
+            else:
+                # Still settling; keep commanding final position (done in _interpolate_trajectory)
+                self.get_logger().debug(
+                    f"Robot settling towards target. Max joint error: {max_error:.6f} rad "
+                    f"(tolerance: {self.position_tolerance} rad)"
+                )
 
     def publish_cube_pose(self):
         # Example pose data; replace with actual data from MuJoCo

@@ -3,16 +3,27 @@ import numpy as np
 
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Bool
 from panda_interfaces.srv import PlanMotion
 from .task_planner import TaskPlanner
 
 class TaskPlannerNode(Node):
+    # State machine states
+    STATE_IDLE = 0
+    STATE_WAITING_FOR_SETUP = 1
+    STATE_WAITING_FOR_GRASP = 2
+    STATE_DONE = 3
+
     def __init__(self):
         super().__init__('task_planner_node')
-        self.task_planner = TaskPlanner(grasp_offset=0.13)
+        # Setup planner: offset=0.13 for approach position
+        self.setup_planner = TaskPlanner(grasp_offset=0.13)
+        # Grasp planner: offset=0 for actual grasp position
+        self.grasp_planner = TaskPlanner(grasp_offset=0.10)
         self.latest_cube_pose = None
-        self.planning_requested = False
-        self.waiting_for_plan = False
+        self.current_state = self.STATE_IDLE
+        self.setup_pose = None
+        self.grasp_pose = None
 
         self.pose_subscription = self.create_subscription(
             PoseStamped,
@@ -22,31 +33,67 @@ class TaskPlannerNode(Node):
         )
 
         self.plan_motion_client = self.create_client(PlanMotion, '/plan_motion')
-        self.plan_timer = self.create_timer(20.0, self._periodic_plan_request)
-        self.get_logger().info("Task Planner Node initialized.")
+        
+        # Subscribe to motion completion signal
+        self.motion_completed_subscription = self.create_subscription(
+            Bool,
+            '/motion_completed',
+            self.motion_completed_callback,
+            10
+        )
+
+        self.gripper_command_publisher = self.create_publisher(Bool, '/gripper_command', 10)
+        # Initial state transition: start with requesting setup pose
+        self.setup_timer = self.create_timer(2.0, self._request_setup_motion)
+        self.get_logger().info("Task Planner Node initialized. Waiting for cube pose to request setup motion.")
 
     def cube_pose_callback(self, msg):
-        # Store only the latest cube pose; do not trigger motion planning here.
+        # Store the latest cube pose for use when generating motion plans
         self.latest_cube_pose = msg
         self.get_logger().debug(
             f"Updated latest cube pose: frame_id={msg.header.frame_id}, "
             f"position=({msg.pose.position.x}, {msg.pose.position.y}, {msg.pose.position.z})"
         )
 
-    def _periodic_plan_request(self):
-        self.request_motion_plan()
-
-    def request_motion_plan(self):
+    def _request_setup_motion(self):
+        """Request motion to setup/pre-grasp pose."""
         if self.latest_cube_pose is None:
-            self.get_logger().warn("No cube pose available to request a motion plan.")
+            self.get_logger().warn("No cube pose available yet; waiting for cube_pose message.")
             return
 
-        if self.waiting_for_plan:
-            self.get_logger().warn("A motion-plan request is already in progress; skipping this request.")
+        if self.current_state != self.STATE_IDLE:
+            # Timer is no longer needed; cancel it
             return
 
-        self.planning_requested = True
-        self.waiting_for_plan = True
+        self.current_state = self.STATE_WAITING_FOR_SETUP
+        
+        cube_msg = self.latest_cube_pose
+        cube_pos = np.array([
+            cube_msg.pose.position.x,
+            cube_msg.pose.position.y,
+            cube_msg.pose.position.z,
+        ])
+        cube_ori = np.array([
+            cube_msg.pose.orientation.x,
+            cube_msg.pose.orientation.y,
+            cube_msg.pose.orientation.z,
+            cube_msg.pose.orientation.w,
+        ])
+
+        # Generate setup pose using approach offset (0.13)
+        setup_position, setup_orientation = self.setup_planner.generate_grasp_pose(cube_pos, cube_ori)
+        self.setup_pose = (setup_position, setup_orientation)
+
+        self._send_plan_request(self.setup_pose, "SETUP")
+
+    def _request_grasp_motion(self):
+        """Request motion to grasp pose."""
+        if self.latest_cube_pose is None:
+            self.get_logger().warn("No cube pose available; cannot request grasp motion.")
+            self.current_state = self.STATE_IDLE
+            return
+
+        self.current_state = self.STATE_WAITING_FOR_GRASP
 
         cube_msg = self.latest_cube_pose
         cube_pos = np.array([
@@ -60,52 +107,75 @@ class TaskPlannerNode(Node):
             cube_msg.pose.orientation.z,
             cube_msg.pose.orientation.w,
         ])
-        grasp_position, grasp_orientation = self.task_planner.generate_grasp_pose(cube_pos, cube_ori)
+
+        # Generate grasp pose using zero offset (actual grasp position)
+        grasp_position, grasp_orientation = self.grasp_planner.generate_grasp_pose(cube_pos, cube_ori)
+        self.grasp_pose = (grasp_position, grasp_orientation)
+
+        self._send_plan_request(self.grasp_pose, "GRASP")
+
+    def _send_plan_request(self, pose_tuple, motion_type):
+        """Send a motion plan request to the motion planner."""
+        position, orientation = pose_tuple
 
         request = PlanMotion.Request()
-        request.grasp_pose.header = cube_msg.header
-        request.grasp_pose.pose.position.x = grasp_position[0]
-        request.grasp_pose.pose.position.y = grasp_position[1]
-        request.grasp_pose.pose.position.z = grasp_position[2]
-        request.grasp_pose.pose.orientation.x = grasp_orientation[0]
-        request.grasp_pose.pose.orientation.y = grasp_orientation[1]
-        request.grasp_pose.pose.orientation.z = grasp_orientation[2]
-        request.grasp_pose.pose.orientation.w = grasp_orientation[3]
+        request.grasp_pose.header = self.latest_cube_pose.header
+        request.grasp_pose.pose.position.x = position[0]
+        request.grasp_pose.pose.position.y = position[1]
+        request.grasp_pose.pose.position.z = position[2]
+        request.grasp_pose.pose.orientation.x = orientation[0]
+        request.grasp_pose.pose.orientation.y = orientation[1]
+        request.grasp_pose.pose.orientation.z = orientation[2]
+        request.grasp_pose.pose.orientation.w = orientation[3]
 
         if not self.plan_motion_client.wait_for_service(timeout_sec=5.0):
-            self.waiting_for_plan = False
-            self.planning_requested = False
             self.get_logger().error("/plan_motion service not available.")
+            self.current_state = self.STATE_IDLE
             return
 
         future = self.plan_motion_client.call_async(request)
-        future.add_done_callback(self._plan_response_callback)
+        future.add_done_callback(lambda f: self._plan_response_callback(f, motion_type))
 
         self.get_logger().info(
-            f"Requested motion plan for cube pose: frame_id={cube_msg.header.frame_id}, "
-            f"grasp_position={grasp_position}, grasp_orientation={grasp_orientation}"
+            f"Requested {motion_type} motion plan for cube pose: frame_id={self.latest_cube_pose.header.frame_id}, "
+            f"position={position}, orientation={orientation}"
         )
 
-    def _plan_response_callback(self, future):
-        self.waiting_for_plan = False
+    def motion_completed_callback(self, msg):
+        """Handle motion completion signal from MuJoCo."""
+        if not msg.data:
+            return  # Ignore False messages
 
+        if self.current_state == self.STATE_WAITING_FOR_SETUP:
+            self.get_logger().info("Setup motion completed. Requesting grasp motion.")
+            self._request_grasp_motion()
+        elif self.current_state == self.STATE_WAITING_FOR_GRASP:
+            self.get_logger().info("Grasp motion completed. Sequence finished.")
+            self.gripper_command_publisher.publish(Bool(data=True))  # Close the gripper
+            self.current_state = self.STATE_DONE
+        else:
+            # Ignore completion signals if not waiting for motion
+            self.get_logger().debug(f"Received /motion_completed but not waiting for motion (state={self.current_state})")
+
+
+    def _plan_response_callback(self, future, motion_type="UNKNOWN"):
         try:
             response = future.result()
         except Exception as exc:
-            self.planning_requested = False
             self.get_logger().error(f"/plan_motion service call failed: {exc}")
+            self.current_state = self.STATE_IDLE
             return
 
-        self.planning_requested = False
         self.get_logger().info(
-            f"Plan response: success={response.success}, message={response.message}, "
+            f"Plan response for {motion_type}: success={response.success}, message={response.message}, "
             f"trajectory_points={len(response.trajectory.points)}"
         )
 
         if response.success:
-            self.get_logger().info("Motion plan succeeded; can request a new plan when appropriate.")
+            self.get_logger().info(f"{motion_type} motion plan succeeded; waiting for execution to complete.")
         else:
-            self.get_logger().warn("Motion plan failed; can request a new plan when appropriate.")
+            self.get_logger().warn(f"{motion_type} motion plan failed; resetting to idle state.")
+            self.current_state = self.STATE_IDLE
 
 def main(args=None):
 
