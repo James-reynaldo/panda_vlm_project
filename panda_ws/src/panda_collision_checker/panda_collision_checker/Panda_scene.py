@@ -1,10 +1,12 @@
+import os
+
+import numpy as np
+import robosuite
 from robosuite.environments.manipulation.single_arm_env import SingleArmEnv
 from robosuite.models.arenas import TableArena
 from robosuite.models.tasks import ManipulationTask
 from robosuite.models.objects import BoxObject, CylinderObject, MujocoXMLObject
 from robosuite.utils.placement_samplers import UniformRandomSampler
-import numpy as np
-import os
 
 class CabinetObject(MujocoXMLObject):
     """
@@ -37,6 +39,9 @@ class PandaScene(SingleArmEnv):
 
         self.cabinet_pos = np.array([0.0, 0.3, 0.82])
         self.cabinet_quat = np.array([1.0, 0.0, 0.0, 0.0])
+
+        if controller_configs is None:
+            controller_configs = robosuite.load_controller_config(default_controller="JOINT_POSITION")
 
         super().__init__(
             robots=robots,

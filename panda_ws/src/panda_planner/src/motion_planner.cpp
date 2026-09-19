@@ -13,6 +13,7 @@
 #include <ompl/base/spaces/RealVectorStateSpace.h>
 #include <ompl/geometric/SimpleSetup.h>
 #include <ompl/geometric/planners/rrt/RRTConnect.h>
+#include <ompl/geometric/PathSimplifier.h>
 
 #include "panda_interfaces/srv/collision_check.hpp"
 
@@ -311,6 +312,20 @@ public:
 
         ompl::geometric::PathGeometric path = ss.getSolutionPath();
         path.interpolate();
+
+        // Log path statistics before simplification
+        size_t states_before = path.getStateCount();
+        RCLCPP_INFO(this->get_logger(), "Initial path has %zu states.", states_before);
+
+        // Simplify the path using OMPL's PathSimplifier
+        ompl::geometric::PathSimplifier ps(ss.getSpaceInformation());
+        ps.simplify(path, OMPL_PLANNING_TIME * 0.1);  // Use 10% of planning time for simplification
+
+        // Log path statistics after simplification
+        size_t states_after = path.getStateCount();
+        double path_length = path.length();
+        RCLCPP_INFO(this->get_logger(), "Simplified path has %zu states (reduced by %zu). Path length: %.4f",
+                    states_after, states_before - states_after, path_length);
 
         trajectory_msg.header.stamp = this->now();
         trajectory_msg.header.frame_id = "world";

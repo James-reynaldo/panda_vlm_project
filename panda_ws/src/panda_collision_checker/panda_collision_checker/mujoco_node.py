@@ -3,9 +3,11 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory
 
 import numpy as np
 from panda_collision_checker.Panda_scene import PandaScene
+
 
 class MujocoNode(Node):
     def __init__(self):
@@ -22,13 +24,84 @@ class MujocoNode(Node):
         self.env.reset()
 
         self.cube_id = self.env.sim.model.body_name2id("red_cube_main")
+        self._zero_action = np.zeros(self.env.action_dim, dtype=np.float64)
+        self._trajectory = None
+        self._trajectory_start = None
         self.get_logger().info(f"Cube ID: {self.cube_id}")
+
         self.cube_pose_publisher = self.create_publisher(PoseStamped, 'cube_pose', 10)
         self.panda_base_pose_publisher = self.create_publisher(PoseStamped, 'panda_base_pose', 10)
         self.panda_joint_state_publisher = self.create_publisher(JointState, 'panda_joint_states', 10)
-        self.cube_timer = self.create_timer(0.1, self.publish_cube_pose)
-        self.panda_base_timer = self.create_timer(0.1, self.publish_panda_base_pose)
-        self.panda_joint_state_timer = self.create_timer(0.1, self.publish_panda_joint_states)
+        self.trajectory_subscriber = self.create_subscription(JointTrajectory, 'joint_trajectory', self.trajectory_callback, 10)
+
+        # Single synchronized simulation/render/publish loop
+        self.sim_timer = self.create_timer(0.05, self.simulation_loop)
+
+    def trajectory_callback(self, msg):
+        if not msg.points or not msg.joint_names:
+            return
+
+        points = []
+        for point in msg.points:
+            if len(point.positions) == 0:
+                continue
+            t = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
+            points.append((float(t), np.asarray(point.positions, dtype=np.float64)))
+
+        if not points:
+            return
+
+        self._trajectory = points
+        self._trajectory_start = self.get_clock().now().nanoseconds * 1e-9
+
+    def _interpolate_trajectory(self):
+        if self._trajectory is None or self._trajectory_start is None:
+            return None
+
+        now = self.get_clock().now().nanoseconds * 1e-9
+        elapsed = now - self._trajectory_start
+
+        if elapsed <= self._trajectory[0][0]:
+            target_qpos = self._trajectory[0][1].copy()
+        elif elapsed >= self._trajectory[-1][0]:
+            target_qpos = self._trajectory[-1][1].copy()
+        else:
+            for i in range(1, len(self._trajectory)):
+                t_prev, q_prev = self._trajectory[i - 1]
+                t_next, q_next = self._trajectory[i]
+                if elapsed <= t_next:
+                    if t_next <= t_prev:
+                        target_qpos = q_next.copy()
+                    else:
+                        alpha = (elapsed - t_prev) / (t_next - t_prev)
+                        target_qpos = q_prev + alpha * (q_next - q_prev)
+                    break
+            else:
+                target_qpos = self._trajectory[-1][1].copy()
+
+        return target_qpos
+
+    def simulation_loop(self):
+        action = self._zero_action.copy()
+        trajectory_goal = self._interpolate_trajectory()
+
+        if trajectory_goal is not None:
+            robot = self.env.robots[0]
+            current_qpos = np.asarray(robot._joint_positions, dtype=np.float64)
+            joint_delta = np.asarray(trajectory_goal, dtype=np.float64) - current_qpos
+            action_dim = robot.controller.control_dim
+            action[:action_dim] = joint_delta[:action_dim]
+
+        # 1) Advance the MuJoCo/robosuite simulation by one timestep.
+        self.env.step(action)
+
+        # 2) Render the environment.
+        self.env.render()
+
+        # 3-5) Publish state in the same loop.
+        self.publish_cube_pose()
+        self.publish_panda_base_pose()
+        self.publish_panda_joint_states()
 
     def publish_cube_pose(self):
         # Example pose data; replace with actual data from MuJoCo

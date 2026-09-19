@@ -9,7 +9,7 @@ from .task_planner import TaskPlanner
 class TaskPlannerNode(Node):
     def __init__(self):
         super().__init__('task_planner_node')
-        self.task_planner = TaskPlanner(grasp_offset=0.10)
+        self.task_planner = TaskPlanner(grasp_offset=0.13)
         self.latest_cube_pose = None
         self.planning_requested = False
         self.waiting_for_plan = False
@@ -22,7 +22,7 @@ class TaskPlannerNode(Node):
         )
 
         self.plan_motion_client = self.create_client(PlanMotion, '/plan_motion')
-        self.plan_timer = self.create_timer(10.0, self._periodic_plan_request)
+        self.plan_timer = self.create_timer(20.0, self._periodic_plan_request)
         self.get_logger().info("Task Planner Node initialized.")
 
     def cube_pose_callback(self, msg):
