@@ -12,18 +12,29 @@ class TaskPlannerNode(Node):
     STATE_IDLE = 0
     STATE_WAITING_FOR_SETUP = 1
     STATE_WAITING_FOR_GRASP = 2
-    STATE_DONE = 3
+    STATE_WAITING_FOR_GRIPPER_CLOSE = 3
+    STATE_WAITING_FOR_PRE_PLACE = 4
+    STATE_WAITING_FOR_PLACE = 5
+    STATE_DONE = 6
 
     def __init__(self):
         super().__init__('task_planner_node')
         # Setup planner: offset=0.13 for approach position
         self.setup_planner = TaskPlanner(grasp_offset=0.13)
         # Grasp planner: offset=0 for actual grasp position
-        self.grasp_planner = TaskPlanner(grasp_offset=0.10)
+        self.grasp_planner = TaskPlanner(grasp_offset=0.07)
+        # Pre-place planner: approach the drawer with a 13 cm offset.
+        self.pre_place_planner = TaskPlanner(grasp_offset=0.13)
         self.latest_cube_pose = None
         self.current_state = self.STATE_IDLE
         self.setup_pose = None
         self.grasp_pose = None
+        # Target inside the lower drawer, expressed in the cube_pose/world frame.
+        self.lower_drawer_position = np.array([0.0, 0.1, 0.93])  # Adjusted to be above the drawer for placement
+        self.pre_place_pose = None
+        self.place_pose = None
+        self.gripper_close_timer = None
+
 
         self.pose_subscription = self.create_subscription(
             PoseStamped,
@@ -114,6 +125,44 @@ class TaskPlannerNode(Node):
 
         self._send_plan_request(self.grasp_pose, "GRASP")
 
+    def _request_pre_place_motion(self):
+        """Request motion to the approach pose above the lower drawer."""
+        if self.grasp_pose is None:
+            self.get_logger().error("No grasp pose is available; cannot request pre-place motion.")
+            self.current_state = self.STATE_IDLE
+            return
+
+        self.current_state = self.STATE_WAITING_FOR_PRE_PLACE
+
+        self.pre_place_pose = self.pre_place_planner.generate_approach_pose(
+            self.lower_drawer_position,
+            self.grasp_pose[1],
+        )
+        self._send_plan_request(self.pre_place_pose, "PRE_PLACE_IN_LOWER_DRAWER")
+
+    def _request_place_motion(self):
+        """Request motion from the pre-place pose to the lower-drawer target."""
+        if self.grasp_pose is None:
+            self.get_logger().error("No grasp pose is available; cannot request placement motion.")
+            self.current_state = self.STATE_IDLE
+            return
+
+        self.current_state = self.STATE_WAITING_FOR_PLACE
+
+        # Keep the end-effector orientation used to grasp the cube while
+        # descending from the pre-place pose to the lower-drawer target.
+        self.place_pose = (self.lower_drawer_position, self.grasp_pose[1])
+        self._send_plan_request(self.place_pose, "PLACE_IN_LOWER_DRAWER")
+
+    def _close_gripper_then_request_pre_place(self):
+        """Give the gripper command one control cycle before transporting the cube."""
+        if self.gripper_close_timer is not None:
+            self.gripper_close_timer.cancel()
+            self.gripper_close_timer = None
+
+        self.get_logger().info("Gripper closed. Requesting lower-drawer pre-place motion.")
+        self._request_pre_place_motion()
+
     def _send_plan_request(self, pose_tuple, motion_type):
         """Send a motion plan request to the motion planner."""
         position, orientation = pose_tuple
@@ -137,7 +186,7 @@ class TaskPlannerNode(Node):
         future.add_done_callback(lambda f: self._plan_response_callback(f, motion_type))
 
         self.get_logger().info(
-            f"Requested {motion_type} motion plan for cube pose: frame_id={self.latest_cube_pose.header.frame_id}, "
+            f"Requested {motion_type} motion plan: frame_id={self.latest_cube_pose.header.frame_id}, "
             f"position={position}, orientation={orientation}"
         )
 
@@ -150,8 +199,20 @@ class TaskPlannerNode(Node):
             self.get_logger().info("Setup motion completed. Requesting grasp motion.")
             self._request_grasp_motion()
         elif self.current_state == self.STATE_WAITING_FOR_GRASP:
-            self.get_logger().info("Grasp motion completed. Sequence finished.")
+            self.get_logger().info("Grasp motion completed. Closing gripper.")
             self.gripper_command_publisher.publish(Bool(data=True))  # Close the gripper
+            self.current_state = self.STATE_WAITING_FOR_GRIPPER_CLOSE
+            # The simulator applies gripper commands in its control loop. Wait
+            # briefly before starting the trajectory that transports the cube.
+            self.gripper_close_timer = self.create_timer(
+                0.25, self._close_gripper_then_request_pre_place
+            )
+        elif self.current_state == self.STATE_WAITING_FOR_PRE_PLACE:
+            self.get_logger().info("Pre-place motion completed. Requesting lower-drawer placement motion.")
+            self._request_place_motion()
+        elif self.current_state == self.STATE_WAITING_FOR_PLACE:
+            self.get_logger().info("Lower-drawer placement motion completed. Opening gripper.")
+            self.gripper_command_publisher.publish(Bool(data=False))  # Release the cube
             self.current_state = self.STATE_DONE
         else:
             # Ignore completion signals if not waiting for motion

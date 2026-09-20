@@ -4,9 +4,12 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <future>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -25,6 +28,7 @@
 
 constexpr double HAND_OFFSET = -0.107;
 constexpr double OMPL_PLANNING_TIME = 10.0;
+constexpr double JOINT_LIMIT_WARNING_DISTANCE = 0.1;
 
 static constexpr double PANDA_BASE_X = 0.0;
 static constexpr double PANDA_BASE_Y = -0.65;
@@ -141,8 +145,19 @@ bool solvePandaIK(
     const std::array<double, 7>& q_actual,
     std::vector<std::array<double, 7>>& q_solution)
 {
+    q_solution.clear();
+
     std::array<double, 16> O_T_EE =
         toIKMatrix(T_base_grasp);
+
+    bool found_in_limit_solution = false;
+    bool found_margin_solution = false;
+    double closest_in_limit_distance = std::numeric_limits<double>::infinity();
+    double smallest_distance = std::numeric_limits<double>::infinity();
+    double selected_minimum_limit_distance = std::numeric_limits<double>::infinity();
+    std::array<double, 7> closest_solution{};
+    double closest_in_limit_minimum_limit_distance = std::numeric_limits<double>::infinity();
+    std::array<double, 7> closest_in_limit_solution{};
 
     // Search over redundant joint q7
     for (double q7 = -3.0; q7 <= 3.0; q7 += 0.25)
@@ -155,30 +170,105 @@ bool solvePandaIK(
 
         for (const auto& solution : solutions)
         {
-            // Check whether solution is valid
+            // Validate every joint explicitly before considering this IK solution.
             bool valid = true;
-
-            for (double q : solution)
+            bool satisfies_safety_margin = true;
+            double minimum_limit_distance = std::numeric_limits<double>::infinity();
+            for (std::size_t joint = 0; joint < solution.size(); ++joint)
             {
-                if (std::isnan(q) || std::isinf(q))
+                const double q = solution[joint];
+                if (std::isnan(q) || std::isinf(q) ||
+                    q < PANDA_JOINT_LIMITS_LOW[joint] ||
+                    q > PANDA_JOINT_LIMITS_HIGH[joint])
                 {
                     valid = false;
                     break;
+                }
+
+                const double distance_to_lower = q - PANDA_JOINT_LIMITS_LOW[joint];
+                const double distance_to_upper = PANDA_JOINT_LIMITS_HIGH[joint] - q;
+                minimum_limit_distance = std::min(
+                    minimum_limit_distance,
+                    std::min(distance_to_lower, distance_to_upper));
+
+                if (q < PANDA_JOINT_LIMITS_LOW[joint] + JOINT_LIMIT_WARNING_DISTANCE ||
+                    q > PANDA_JOINT_LIMITS_HIGH[joint] - JOINT_LIMIT_WARNING_DISTANCE)
+                {
+                    satisfies_safety_margin = false;
                 }
             }
 
             if (!valid)
                 continue;
 
-            if (!isWithinJointLimits(solution))
-                continue;
+            double squared_distance = 0.0;
+            for (std::size_t joint = 0; joint < solution.size(); ++joint)
+            {
+                const double joint_delta = solution[joint] - q_actual[joint];
+                squared_distance += joint_delta * joint_delta;
+            }
 
-            q_solution.push_back(solution);
-            return true;
+            const double distance = std::sqrt(squared_distance);
+            if (distance < closest_in_limit_distance)
+            {
+                closest_in_limit_distance = distance;
+                closest_in_limit_minimum_limit_distance = minimum_limit_distance;
+                closest_in_limit_solution = solution;
+                found_in_limit_solution = true;
+            }
+
+            if (satisfies_safety_margin && distance < smallest_distance)
+            {
+                smallest_distance = distance;
+                selected_minimum_limit_distance = minimum_limit_distance;
+                closest_solution = solution;
+                found_margin_solution = true;
+            }
         }
     }
 
-    return false;
+    if (!found_in_limit_solution)
+        return false;
+
+    const auto ik_logger = rclcpp::get_logger("panda_ik");
+    if (!found_margin_solution)
+    {
+        closest_solution = closest_in_limit_solution;
+        smallest_distance = closest_in_limit_distance;
+        selected_minimum_limit_distance = closest_in_limit_minimum_limit_distance;
+        RCLCPP_WARN(
+            ik_logger,
+            "No IK solution satisfies the %.1f rad joint-limit safety margin; "
+            "falling back to the closest solution within the actual joint limits.",
+            JOINT_LIMIT_WARNING_DISTANCE);
+    }
+
+    RCLCPP_INFO(
+        ik_logger,
+        "Selected IK solution: [%f, %f, %f, %f, %f, %f, %f]; "
+        "joint-space distance: %.6f rad; minimum joint-limit distance: %.6f rad",
+        closest_solution[0], closest_solution[1], closest_solution[2], closest_solution[3],
+        closest_solution[4], closest_solution[5], closest_solution[6],
+        smallest_distance, selected_minimum_limit_distance);
+
+    for (std::size_t joint = 0; joint < closest_solution.size(); ++joint)
+    {
+        const double distance_to_lower = closest_solution[joint] - PANDA_JOINT_LIMITS_LOW[joint];
+        const double distance_to_upper = PANDA_JOINT_LIMITS_HIGH[joint] - closest_solution[joint];
+        const bool near_lower_limit = distance_to_lower <= JOINT_LIMIT_WARNING_DISTANCE;
+        const bool near_upper_limit = distance_to_upper <= JOINT_LIMIT_WARNING_DISTANCE;
+
+        RCLCPP_INFO(
+            ik_logger,
+            "%s: q=%.6f rad, lower-distance=%.6f rad, upper-distance=%.6f rad%s%s",
+            PANDA_JOINT_NAMES[joint], closest_solution[joint],
+            distance_to_lower, distance_to_upper,
+            near_lower_limit ? " [WITHIN 0.1 RAD OF LOWER LIMIT]" : "",
+            near_upper_limit ? " [WITHIN 0.1 RAD OF UPPER LIMIT]" : "");
+    }
+
+    q_solution.push_back(closest_solution);
+    return true;
 }
 
 class MotionPlanner : public rclcpp::Node

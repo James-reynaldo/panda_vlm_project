@@ -97,7 +97,7 @@ int main()
     // ============================================================
 
     Eigen::Vector3d grasp_position_world(
-        -0.2,  -0.1,   0.85
+        0.0,  0.05,   0.9
     );
     // Eigen::Vector3d grasp_position_world(
     //     0.0,

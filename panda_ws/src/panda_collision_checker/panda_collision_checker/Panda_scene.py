@@ -33,7 +33,7 @@ class PandaScene(SingleArmEnv):
 
     def __init__(self, robots, env_configuration="default", render=False,has_offscreen_renderer=False,controller_configs=None, **kwargs):
         self.table_full_size = (1.0, 1.0, 0.05)
-        self.red_cube_size = (0.02, 0.02, 0.1)
+        self.red_cube_size = (0.02, 0.02, 0.05)
         self.table_offset = (0, 0, 0.80)
         self.object_placements = None
 
@@ -42,6 +42,9 @@ class PandaScene(SingleArmEnv):
 
         if controller_configs is None:
             controller_configs = robosuite.load_controller_config(default_controller="JOINT_POSITION")
+
+        controller_configs["output_max"] = 0.1
+        controller_configs["output_min"] = -0.1
 
         super().__init__(
             robots=robots,

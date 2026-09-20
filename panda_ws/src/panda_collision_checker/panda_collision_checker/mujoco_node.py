@@ -31,7 +31,7 @@ class MujocoNode(Node):
         self.get_logger().info(f"Cube ID: {self.cube_id}")
 
         # Joint position tolerance for trajectory completion (radians)
-        self.position_tolerance = 0.05
+        self.position_tolerance = 0.06
 
         self.cube_pose_publisher = self.create_publisher(PoseStamped, 'cube_pose', 10)
         self.panda_base_pose_publisher = self.create_publisher(PoseStamped, 'panda_base_pose', 10)
@@ -101,26 +101,100 @@ class MujocoNode(Node):
     def simulation_loop(self):
         action = self._zero_action.copy()
 
+        # ---------------------------------------------------------
         # Arm trajectory
+        # ---------------------------------------------------------
         trajectory_goal = self._interpolate_trajectory()
 
         if trajectory_goal is not None:
             robot = self.env.robots[0]
-            current_qpos = np.asarray(robot._joint_positions, dtype=np.float64)
+            controller = robot.controller
+
+            current_qpos = np.asarray(
+                robot._joint_positions,
+                dtype=np.float64
+            )
 
             joint_delta = trajectory_goal - current_qpos
-            action_dim = robot.controller.control_dim
+            action_dim = controller.control_dim
+
+            # IMPORTANT:
+            # action is the normalized JOINT_POSITION controller input.
+            # Do NOT manually convert it using output/input ranges here.
             action[:action_dim] = joint_delta[:action_dim]
 
-        # Gripper command — always apply it
+            # -----------------------------------------------------
+            # Controller diagnostic
+            # -----------------------------------------------------
+            try:
+                scaled_action = controller.scale_action(
+                    action[:action_dim].copy()
+                )
+
+                max_joint = int(np.argmax(np.abs(joint_delta[:action_dim])))
+
+                self.get_logger().info(
+                    f"[TRACKING] "
+                    f"joint={max_joint} "
+                    f"target={trajectory_goal[max_joint]:.6f} "
+                    f"current={current_qpos[max_joint]:.6f} "
+                    f"error={joint_delta[max_joint]:+.6f} "
+                    f"raw_action={action[max_joint]:+.6f} "
+                    f"scaled_action={scaled_action[max_joint]:+.6f}"
+                )
+
+            except Exception as e:
+                self.get_logger().warn(
+                    f"[TRACKING] Could not inspect controller scaling: {e}"
+                )
+
+        # ---------------------------------------------------------
+        # Gripper
+        # ---------------------------------------------------------
         if self._gripper_closed:
             action[7] = 1.0
         else:
             action[7] = -1.0
 
+        # ---------------------------------------------------------
+        # Simulation step
+        # ---------------------------------------------------------
+        q_before = np.asarray(
+            self.env.robots[0]._joint_positions,
+            dtype=np.float64
+        ).copy()
+
         self.env.step(action)
+
+        q_after = np.asarray(
+            self.env.robots[0]._joint_positions,
+            dtype=np.float64
+        ).copy()
+
+        # ---------------------------------------------------------
+        # Actual movement diagnostic
+        # ---------------------------------------------------------
+        if trajectory_goal is not None:
+            actual_change = q_after - q_before
+
+            max_joint = int(np.argmax(np.abs(joint_delta[:action_dim])))
+
+            self.get_logger().info(
+                f"[TRACKING AFTER] "
+                f"joint={max_joint} "
+                f"q_before={q_before[max_joint]:.6f} "
+                f"q_after={q_after[max_joint]:.6f} "
+                f"actual_change={actual_change[max_joint]:+.6f}"
+            )
+
+        # ---------------------------------------------------------
+        # Rendering
+        # ---------------------------------------------------------
         self.env.render()
 
+        # ---------------------------------------------------------
+        # Completion / state publishing
+        # ---------------------------------------------------------
         self._check_and_publish_trajectory_completion()
 
         self.publish_cube_pose()
