@@ -406,6 +406,9 @@ public:
             return this->checkCollision(q);
         });
 
+        //Finer resolution for state validity checking to avoid missing collisions
+        ss.getSpaceInformation()->setStateValidityCheckingResolution(0.001); // 1% of the space's maximum extent
+
         ompl::base::ScopedState<ompl::base::RealVectorStateSpace> start(space);
         for (std::size_t i = 0; i < 7; ++i)
         {
@@ -435,23 +438,61 @@ public:
         }
 
         ompl::geometric::PathGeometric path = ss.getSolutionPath();
-        path.interpolate();
 
         // Log path statistics before simplification
         size_t states_before = path.getStateCount();
-        RCLCPP_INFO(this->get_logger(), "Initial path has %zu states.", states_before);
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Initial RRTConnect path has %zu states.",
+            states_before
+        );
 
-        // Simplify the path using OMPL's PathSimplifier
+        // Simplify the path
         ompl::geometric::PathSimplifier ps(ss.getSpaceInformation());
-        ps.simplify(path, OMPL_PLANNING_TIME * 0.1);  // Use 10% of planning time for simplification
+        ps.simplify(path, OMPL_PLANNING_TIME * 0.1);
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Simplified path has %zu states.",
+            path.getStateCount()
+        );
+
+        // Explicitly verify the simplified path
+        if (!path.check())
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Simplified path failed collision validation."
+            );
+            return false;
+        }
+
+        // Now generate enough samples for trajectory execution
+        path.interpolate(100);
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Interpolated execution path has %zu states.",
+            path.getStateCount()
+        );
+
+        // Verify the actual interpolated path as well
+        if (!path.check())
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Interpolated path failed collision validation."
+            );
+            return false;
+        }
 
         // Keep a dense trajectory even when OMPL simplifies aggressively.
         // This ensures the MuJoCo node gets a usable multi-point path instead of just the start/end states.
-        constexpr std::size_t target_samples = 20;
-        if (path.getStateCount() < target_samples)
-        {
-            path.interpolate(static_cast<int>(target_samples));
-        }
+        // constexpr std::size_t target_samples = 50;
+        // if (path.getStateCount() < target_samples)
+        // {
+        //     path.interpolate(static_cast<int>(target_samples));
+        // }
 
         // Log path statistics after simplification
         size_t states_after = path.getStateCount();
@@ -495,7 +536,7 @@ public:
         trajectory_msg.joint_names = current_joint_names_;
         trajectory_msg.points.resize(path.getStateCount());
 
-        const double total_duration = std::max(0.1, path_length * 0.12);
+        const double total_duration = std::max(2.0, path_length * 1.0);
         const double dt = path.getStateCount() > 1 ? total_duration / (path.getStateCount() - 1) : 0.0;
         for (std::size_t i = 0; i < path.getStateCount(); ++i)
         {

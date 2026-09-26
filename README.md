@@ -10,6 +10,6 @@ ros2 launch panda_collision_checker mujoco_node.launch.py
 ros2 launch panda_collision_checker mujoco_node.launch.py control_mode:=manual
 
 # Or via command line
-ros2 run panda_collision_checker mujoco_node --ros-args -p control_mode:=manual device_type:=spacemouse
+ros2 run panda_collision_checker mujoco_node --ros-args -p control_mode:=manual -p device_type:=spacemouse
 
 rm -rf ~/.ros/log/*

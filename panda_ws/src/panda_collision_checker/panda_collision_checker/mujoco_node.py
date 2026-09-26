@@ -76,7 +76,7 @@ class MujocoNode(Node):
         self.input_device_initialized = False
         
         # Single synchronized simulation/render/publish loop
-        self.sim_timer = self.create_timer(0.05, self.simulation_loop)
+        self.sim_timer = self.create_timer(0.01, self.simulation_loop)
 
     def print_gripper_orientation(self):
         """Print current gripper orientation as quaternion in xyzw order."""
