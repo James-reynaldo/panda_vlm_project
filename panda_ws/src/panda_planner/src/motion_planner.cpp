@@ -158,28 +158,37 @@ bool solvePandaIK(
     std::array<double, 7> closest_solution{};
     double closest_in_limit_minimum_limit_distance = std::numeric_limits<double>::infinity();
     std::array<double, 7> closest_in_limit_solution{};
+    std::size_t ik_slots_checked = 0;
+    std::size_t ik_slots_non_finite = 0;
+    std::size_t ik_slots_outside_configured_limits = 0;
+    std::size_t ik_valid_candidates = 0;
+    std::size_t ik_margin_candidates = 0;
 
     // Search over redundant joint q7
-    for (double q7 = -3.0; q7 <= 3.0; q7 += 0.25)
+    for (double q7 = -2.5; q7 <= 2.5; q7 += 0.1)
     {
         auto solutions = franka_IK_EE(
             O_T_EE,
             q7,
             q_actual
         );
-
         for (const auto& solution : solutions)
         {
-            // Validate every joint explicitly before considering this IK solution.
+            ++ik_slots_checked;
             bool valid = true;
             bool satisfies_safety_margin = true;
+            bool non_finite = false;
             double minimum_limit_distance = std::numeric_limits<double>::infinity();
             for (std::size_t joint = 0; joint < solution.size(); ++joint)
             {
                 const double q = solution[joint];
-                if (std::isnan(q) || std::isinf(q) ||
-                    q < PANDA_JOINT_LIMITS_LOW[joint] ||
-                    q > PANDA_JOINT_LIMITS_HIGH[joint])
+                if (!std::isfinite(q))
+                {
+                    valid = false;
+                    non_finite = true;
+                    break;
+                }
+                if (q < PANDA_JOINT_LIMITS_LOW[joint] || q > PANDA_JOINT_LIMITS_HIGH[joint])
                 {
                     valid = false;
                     break;
@@ -199,16 +208,31 @@ bool solvePandaIK(
             }
 
             if (!valid)
+            {
+                if (non_finite)
+                    ++ik_slots_non_finite;
+                else
+                    ++ik_slots_outside_configured_limits;
                 continue;
+            }
 
-            double squared_distance = 0.0;
+            ++ik_valid_candidates;
+
+            // Penalize the redundant wrist-roll joint (q7) the most: it is the
+            // easiest way for the IK solver to produce a large, visually obvious
+            // wrist rotation while still satisfying the same end-effector pose.
+            constexpr std::array<double, 7> joint_weights = {
+                1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 10.0
+            };
+
+            double weighted_distance_sq = 0.0;
             for (std::size_t joint = 0; joint < solution.size(); ++joint)
             {
                 const double joint_delta = solution[joint] - q_actual[joint];
-                squared_distance += joint_delta * joint_delta;
+                weighted_distance_sq += joint_weights[joint] * joint_delta * joint_delta;
             }
 
-            const double distance = std::sqrt(squared_distance);
+            const double distance = std::sqrt(weighted_distance_sq);
             if (distance < closest_in_limit_distance)
             {
                 closest_in_limit_distance = distance;
@@ -224,13 +248,26 @@ bool solvePandaIK(
                 closest_solution = solution;
                 found_margin_solution = true;
             }
+            if (satisfies_safety_margin)
+                ++ik_margin_candidates;
         }
     }
 
-    if (!found_in_limit_solution)
-        return false;
-
     const auto ik_logger = rclcpp::get_logger("panda_ik");
+
+    if (!found_in_limit_solution)
+    {
+        RCLCPP_WARN(
+            ik_logger,
+            "IK search failed: checked %zu returned slots across 51 q7 samples; "
+            "%zu contained NaN/Inf and %zu were outside configured joint limits "
+            "(valid candidates: %zu). The IK function returns four slots per q7, "
+            "so its array size does not indicate that it found four solutions.",
+            ik_slots_checked, ik_slots_non_finite, ik_slots_outside_configured_limits,
+            ik_valid_candidates);
+        return false;
+    }
+
     if (!found_margin_solution)
     {
         closest_solution = closest_in_limit_solution;
@@ -239,17 +276,18 @@ bool solvePandaIK(
         RCLCPP_WARN(
             ik_logger,
             "No IK solution satisfies the %.1f rad joint-limit safety margin; "
-            "falling back to the closest solution within the actual joint limits.",
-            JOINT_LIMIT_WARNING_DISTANCE);
+            "falling back to the closest solution within the actual joint limits "
+            "(%zu valid candidates, %zu meeting the margin).",
+            JOINT_LIMIT_WARNING_DISTANCE, ik_valid_candidates, ik_margin_candidates);
     }
 
-    RCLCPP_INFO(
-        ik_logger,
-        "Selected IK solution: [%f, %f, %f, %f, %f, %f, %f]; "
-        "joint-space distance: %.6f rad; minimum joint-limit distance: %.6f rad",
-        closest_solution[0], closest_solution[1], closest_solution[2], closest_solution[3],
-        closest_solution[4], closest_solution[5], closest_solution[6],
-        smallest_distance, selected_minimum_limit_distance);
+    // RCLCPP_INFO(
+    //     ik_logger,
+    //     "Selected IK solution: [%f, %f, %f, %f, %f, %f, %f]; "
+    //     "joint-space distance: %.6f rad; minimum joint-limit distance: %.6f rad",
+    //     closest_solution[0], closest_solution[1], closest_solution[2], closest_solution[3],
+    //     closest_solution[4], closest_solution[5], closest_solution[6],
+    //     smallest_distance, selected_minimum_limit_distance);
 
     for (std::size_t joint = 0; joint < closest_solution.size(); ++joint)
     {
@@ -258,13 +296,13 @@ bool solvePandaIK(
         const bool near_lower_limit = distance_to_lower <= JOINT_LIMIT_WARNING_DISTANCE;
         const bool near_upper_limit = distance_to_upper <= JOINT_LIMIT_WARNING_DISTANCE;
 
-        RCLCPP_INFO(
-            ik_logger,
-            "%s: q=%.6f rad, lower-distance=%.6f rad, upper-distance=%.6f rad%s%s",
-            PANDA_JOINT_NAMES[joint], closest_solution[joint],
-            distance_to_lower, distance_to_upper,
-            near_lower_limit ? " [WITHIN 0.1 RAD OF LOWER LIMIT]" : "",
-            near_upper_limit ? " [WITHIN 0.1 RAD OF UPPER LIMIT]" : "");
+        // RCLCPP_INFO(
+        //     ik_logger,
+        //     "%s: q=%.6f rad, lower-distance=%.6f rad, upper-distance=%.6f rad%s%s",
+        //     PANDA_JOINT_NAMES[joint], closest_solution[joint],
+        //     distance_to_lower, distance_to_upper,
+        //     near_lower_limit ? " [WITHIN 0.1 RAD OF LOWER LIMIT]" : "",
+        //     near_upper_limit ? " [WITHIN 0.1 RAD OF UPPER LIMIT]" : "");
     }
 
     q_solution.push_back(closest_solution);
@@ -331,13 +369,9 @@ public:
 
         try {
             auto response = future.get();
-            if (!response->collision_free) {
-                RCLCPP_WARN(this->get_logger(), "Collision detected for q = [%f, %f, %f, %f, %f, %f, %f]",
-                            q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
-                return false;
-            }
-
-            return true;
+            // Don't log individual collision detections here; trajectory-level validation
+            // will report which states are in collision. This avoids spam during path checking.
+            return response->collision_free;
         } catch (const std::exception& ex) {
             RCLCPP_ERROR(this->get_logger(), "Collision checker service call failed: %s", ex.what());
             return false;
@@ -411,18 +445,58 @@ public:
         ompl::geometric::PathSimplifier ps(ss.getSpaceInformation());
         ps.simplify(path, OMPL_PLANNING_TIME * 0.1);  // Use 10% of planning time for simplification
 
+        // Keep a dense trajectory even when OMPL simplifies aggressively.
+        // This ensures the MuJoCo node gets a usable multi-point path instead of just the start/end states.
+        constexpr std::size_t target_samples = 20;
+        if (path.getStateCount() < target_samples)
+        {
+            path.interpolate(static_cast<int>(target_samples));
+        }
+
         // Log path statistics after simplification
         size_t states_after = path.getStateCount();
         double path_length = path.length();
         RCLCPP_INFO(this->get_logger(), "Simplified path has %zu states (reduced by %zu). Path length: %.4f",
                     states_after, states_before - states_after, path_length);
 
+        // Debug: log first few and last few path points to see if they're duplicates
+        RCLCPP_INFO(this->get_logger(), "Path point samples:");
+        for (std::size_t i = 0; i < path.getStateCount(); ++i)
+        {
+            if (i < 3 || i >= path.getStateCount() - 3 || i % (std::max(1UL, path.getStateCount() / 5)))
+            {
+                const auto* state = path.getState(i)->as<ompl::base::RealVectorStateSpace::StateType>();
+                RCLCPP_INFO(this->get_logger(), "  state[%zu]: [%.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f]",
+                            i, state->values[0], state->values[1], state->values[2], state->values[3],
+                            state->values[4], state->values[5], state->values[6]);
+            }
+        }
+
+        for (std::size_t i = 0; i < path.getStateCount(); ++i)
+        {
+            const auto* state = path.getState(i)->as<ompl::base::RealVectorStateSpace::StateType>();
+            std::array<double, 7> q{};
+            for (std::size_t j = 0; j < 7; ++j)
+            {
+                q[j] = state->values[j];
+            }
+
+            if (!isWithinJointLimits(q) || !checkCollision(q))
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Rejecting OMPL trajectory: interpolated state %zu/%zu is invalid or in collision: [%f, %f, %f, %f, %f, %f, %f]",
+                            i, path.getStateCount(), q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
+                return false;
+            }
+        }
+
         trajectory_msg.header.stamp = this->now();
         trajectory_msg.header.frame_id = "world";
         trajectory_msg.joint_names = current_joint_names_;
         trajectory_msg.points.resize(path.getStateCount());
 
-        const double dt = path.getStateCount() > 1 ? 0.1 : 0.0;
+        const double total_duration = std::max(0.1, path_length * 0.12);
+        const double dt = path.getStateCount() > 1 ? total_duration / (path.getStateCount() - 1) : 0.0;
         for (std::size_t i = 0; i < path.getStateCount(); ++i)
         {
             const auto* state = path.getState(i)->as<ompl::base::RealVectorStateSpace::StateType>();
@@ -468,7 +542,10 @@ private:
                         grasp_pose.pose.orientation.x, grasp_pose.pose.orientation.y, grasp_pose.pose.orientation.z, grasp_pose.pose.orientation.w);
 
             Eigen::Vector3d pos_world(grasp_pose.pose.position.x, grasp_pose.pose.position.y, grasp_pose.pose.position.z);
-            Eigen::Quaterniond ori_world(grasp_pose.pose.orientation.x, grasp_pose.pose.orientation.y, grasp_pose.pose.orientation.z, grasp_pose.pose.orientation.w);
+            Eigen::Quaterniond ori_world(grasp_pose.pose.orientation.w, grasp_pose.pose.orientation.x, grasp_pose.pose.orientation.y, grasp_pose.pose.orientation.z);
+
+            printf("pos_world: [%f, %f, %f]\n", pos_world.x(), pos_world.y(), pos_world.z());
+            printf("ori_world: [%f, %f, %f, %f]\n", ori_world.w(), ori_world.x(), ori_world.y(), ori_world.z());
 
             Eigen::Isometry3d T_base_grasp = transformToPandaBase(
                 pos_world,

@@ -119,6 +119,7 @@ class PandaScene(SingleArmEnv):
         self.model = ManipulationTask(
             mujoco_arena=mujoco_arena,
             mujoco_robots=[robot1],
+            # mujoco_objects=[red_cube, cabinet],
             mujoco_objects=[red_cube, cabinet],
         )
 

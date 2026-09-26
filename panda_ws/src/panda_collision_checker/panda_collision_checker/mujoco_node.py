@@ -7,12 +7,34 @@ from trajectory_msgs.msg import JointTrajectory
 from std_msgs.msg import Bool
 
 import numpy as np
+import robosuite
 from panda_collision_checker.Panda_scene import PandaScene
+
+# Robosuite input handling for manual control
+try:
+    from robosuite.devices import Keyboard
+    from robosuite.utils.input_utils import input2action
+    ROBOSUITE_AVAILABLE = True
+except ImportError:
+    ROBOSUITE_AVAILABLE = False
 
 
 class MujocoNode(Node):
     def __init__(self):
         super().__init__('mujoco_node')
+
+        # Declare and get control mode parameter
+        self.declare_parameter('control_mode', 'planner')  # 'planner' or 'manual'
+        self.control_mode = self.get_parameter('control_mode').value
+        self.get_logger().info(f"Control mode: {self.control_mode}")
+
+        # Manual input needs a controller supported by robosuite input2action.
+        # Planner trajectories keep PandaScene defaulting to JOINT_POSITION.
+        controller_configs = None
+        if self.control_mode == "manual":
+            controller_configs = robosuite.load_controller_config(
+                default_controller="OSC_POSE"
+            )
 
         # Create MuJoCo environment
         self.env = PandaScene(
@@ -21,6 +43,7 @@ class MujocoNode(Node):
             has_renderer=True,
             has_offscreen_renderer=True,
             use_camera_obs=False,
+            controller_configs=controller_configs,
         )
         self.env.reset()
 
@@ -37,7 +60,103 @@ class MujocoNode(Node):
         self.panda_base_pose_publisher = self.create_publisher(PoseStamped, 'panda_base_pose', 10)
         self.panda_joint_state_publisher = self.create_publisher(JointState, 'panda_joint_states', 10)
         self.motion_completed_publisher = self.create_publisher(Bool, '/motion_completed', 10)
+        
+        # Planner mode subscribers
         self.trajectory_subscriber = self.create_subscription(JointTrajectory, 'joint_trajectory', self.trajectory_callback, 10)
+        
+        self.gripper_command_subscriber = self.create_subscription(Bool, '/gripper_command', self.gripper_command_callback, 10)
+
+        # Track trajectory execution state
+        self._trajectory_completed_published = False
+        self._gripper_closed = False  # Track gripper state
+        self._gripper_command_received = False
+
+        # Initialize input device for manual control mode (lazy initialization)
+        self.input_device = None
+        self.input_device_initialized = False
+        
+        # Single synchronized simulation/render/publish loop
+        self.sim_timer = self.create_timer(0.05, self.simulation_loop)
+
+    def print_gripper_orientation(self):
+        """Print current gripper orientation as quaternion in xyzw order."""
+        gripper_id = self.env.sim.model.body_name2id("robot0_right_hand")
+
+        # MuJoCo stores quaternions as [w, x, y, z]
+        quat_wxyz = self.env.sim.data.body_xquat[gripper_id]
+
+        # Convert to [x, y, z, w]
+        quat_xyzw = np.array([
+            quat_wxyz[1],
+            quat_wxyz[2],
+            quat_wxyz[3],
+            quat_wxyz[0]
+        ])
+
+        self.get_logger().info(
+            f"Gripper quaternion (xyzw): "
+            f"[{quat_xyzw[0]:.6f}, "
+            f"{quat_xyzw[1]:.6f}, "
+            f"{quat_xyzw[2]:.6f}, "
+            f"{quat_xyzw[3]:.6f}]"
+        )
+        
+    def _get_param_or_default(self, name, default):
+        """Get parameter value, or return default if not set."""
+        self.declare_parameter(name, default)
+        return self.get_parameter(name).value
+    
+    def _initialize_input_device(self):
+        """Lazy initialize input device on first simulation loop."""
+        if self.input_device_initialized or self.control_mode != 'manual':
+            return
+        
+        self.input_device_initialized = True
+        
+        if not ROBOSUITE_AVAILABLE:
+            self.get_logger().error("robosuite not available. Cannot use manual control mode.")
+            return
+        
+        device_type = self._get_param_or_default('device_type', 'keyboard')
+        try:
+            # if device_type == 'spacemouse':
+            #     try:
+            #         self.input_device = SpaceMouse()
+            #         self.get_logger().info("Initialized SpaceMouse input device for manual control")
+            #     except Exception as e:
+            #         self.get_logger().warn(
+            #             f"Failed to initialize SpaceMouse: {e}. "
+            #             f"Falling back to keyboard input."
+            #         )
+            #         device_type = 'keyboard'
+            
+            if device_type == 'keyboard' and self.input_device is None:
+                try:
+                    self.input_device = Keyboard(pos_sensitivity=1.0, rot_sensitivity=1.0)
+                    self.input_device.start_control()
+                    self.get_logger().info("Initialized Keyboard input device for manual control")
+                except Exception as kb_error:
+                    self.get_logger().error(
+                        f"Failed to initialize Keyboard device: {kb_error}. "
+                        f"This typically means X11 display is not available. "
+                        f"Make sure DISPLAY is set or use X11 forwarding: export DISPLAY=:0"
+                    )
+                    self.input_device = None
+        except Exception as e:
+            self.get_logger().error(f"Unexpected error during input device initialization: {e}")
+            self.input_device = None
+
+        # Joint position tolerance for trajectory completion (radians)
+        self.position_tolerance = 0.06
+
+        self.cube_pose_publisher = self.create_publisher(PoseStamped, 'cube_pose', 10)
+        self.panda_base_pose_publisher = self.create_publisher(PoseStamped, 'panda_base_pose', 10)
+        self.panda_joint_state_publisher = self.create_publisher(JointState, 'panda_joint_states', 10)
+        self.motion_completed_publisher = self.create_publisher(Bool, '/motion_completed', 10)
+        
+        # Planner mode subscribers
+        self.trajectory_subscriber = self.create_subscription(JointTrajectory, 'joint_trajectory', self.trajectory_callback, 10)
+        
         self.gripper_command_subscriber = self.create_subscription(Bool, '/gripper_command', self.gripper_command_callback, 10)
 
         # Track trajectory execution state
@@ -69,6 +188,7 @@ class MujocoNode(Node):
     def gripper_command_callback(self, msg):
         """Handle gripper open/close command."""
         self._gripper_closed = msg.data
+        self._gripper_command_received = True
         self.get_logger().info(f"Gripper command received: {'CLOSE' if msg.data else 'OPEN'}")
 
     def _interpolate_trajectory(self):
@@ -99,8 +219,64 @@ class MujocoNode(Node):
         return target_qpos
 
     def simulation_loop(self):
+        # Lazy initialize input device on first loop
+        self._initialize_input_device()
+        
         action = self._zero_action.copy()
 
+        # ---------------------------------------------------------
+        # Control mode dispatch
+        # ---------------------------------------------------------
+        if self.control_mode == 'planner':
+            action = self._control_planner_mode(action)
+        elif self.control_mode == 'manual':
+            action = self._control_manual_mode(action)
+        else:
+            self.get_logger().warn(f"Unknown control_mode: {self.control_mode}. Using zero action.")
+
+        # ---------------------------------------------------------
+        # Gripper
+        # ---------------------------------------------------------
+        # The final action slot is the gripper for both JOINT_POSITION and OSC_POSE.
+        # In manual mode, preserve the keyboard gripper toggle unless ROS overrides it.
+        if self.control_mode == "planner" or self._gripper_command_received:
+            action[-1] = 1.0 if self._gripper_closed else -1.0
+
+        # ---------------------------------------------------------
+        # Simulation step
+        # ---------------------------------------------------------
+        q_before = np.asarray(
+            self.env.robots[0]._joint_positions,
+            dtype=np.float64
+        ).copy()
+
+        self.env.step(action)
+
+        if self.control_mode == "manual":
+            self.print_gripper_orientation()
+
+        q_after = np.asarray(
+            self.env.robots[0]._joint_positions,
+            dtype=np.float64
+        ).copy()
+
+        # ---------------------------------------------------------
+        # Rendering
+        # ---------------------------------------------------------
+        self.env.render()
+
+        # ---------------------------------------------------------
+        # Completion / state publishing
+        # ---------------------------------------------------------
+        if self.control_mode == 'planner':
+            self._check_and_publish_trajectory_completion()
+
+        self.publish_cube_pose()
+        self.publish_panda_base_pose()
+        self.publish_panda_joint_states()
+
+    def _control_planner_mode(self, action):
+        """Handle trajectory-based planner control mode."""
         # ---------------------------------------------------------
         # Arm trajectory
         # ---------------------------------------------------------
@@ -133,73 +309,40 @@ class MujocoNode(Node):
 
                 max_joint = int(np.argmax(np.abs(joint_delta[:action_dim])))
 
-                self.get_logger().info(
-                    f"[TRACKING] "
-                    f"joint={max_joint} "
-                    f"target={trajectory_goal[max_joint]:.6f} "
-                    f"current={current_qpos[max_joint]:.6f} "
-                    f"error={joint_delta[max_joint]:+.6f} "
-                    f"raw_action={action[max_joint]:+.6f} "
-                    f"scaled_action={scaled_action[max_joint]:+.6f}"
-                )
+                # self.get_logger().info(
+                #     f"[TRACKING] "
+                #     f"joint={max_joint} "
+                #     f"target={trajectory_goal[max_joint]:.6f} "
+                #     f"current={current_qpos[max_joint]:.6f} "
+                #     f"error={joint_delta[max_joint]:+.6f} "
+                #     f"raw_action={action[max_joint]:+.6f} "
+                #     f"scaled_action={scaled_action[max_joint]:+.6f}"
+                # )
 
             except Exception as e:
                 self.get_logger().warn(
                     f"[TRACKING] Could not inspect controller scaling: {e}"
                 )
 
-        # ---------------------------------------------------------
-        # Gripper
-        # ---------------------------------------------------------
-        if self._gripper_closed:
-            action[7] = 1.0
-        else:
-            action[7] = -1.0
+        return action
 
-        # ---------------------------------------------------------
-        # Simulation step
-        # ---------------------------------------------------------
-        q_before = np.asarray(
-            self.env.robots[0]._joint_positions,
-            dtype=np.float64
-        ).copy()
-
-        self.env.step(action)
-
-        q_after = np.asarray(
-            self.env.robots[0]._joint_positions,
-            dtype=np.float64
-        ).copy()
-
-        # ---------------------------------------------------------
-        # Actual movement diagnostic
-        # ---------------------------------------------------------
-        if trajectory_goal is not None:
-            actual_change = q_after - q_before
-
-            max_joint = int(np.argmax(np.abs(joint_delta[:action_dim])))
-
-            self.get_logger().info(
-                f"[TRACKING AFTER] "
-                f"joint={max_joint} "
-                f"q_before={q_before[max_joint]:.6f} "
-                f"q_after={q_after[max_joint]:.6f} "
-                f"actual_change={actual_change[max_joint]:+.6f}"
-            )
-
-        # ---------------------------------------------------------
-        # Rendering
-        # ---------------------------------------------------------
-        self.env.render()
-
-        # ---------------------------------------------------------
-        # Completion / state publishing
-        # ---------------------------------------------------------
-        self._check_and_publish_trajectory_completion()
-
-        self.publish_cube_pose()
-        self.publish_panda_base_pose()
-        self.publish_panda_joint_states()
+    def _control_manual_mode(self, action):
+        """Handle manual input device control mode using robosuite's input2action."""
+        if self.input_device is None:
+            # No input device, use zero action
+            return self._zero_action.copy()
+        
+        try:
+            # input2action reads the device state and returns (action, grasp).
+            robot = self.env.robots[0]
+            device_action, _ = input2action(self.input_device, robot)
+            if device_action is not None:
+                action[:len(device_action)] = device_action
+        except Exception as e:
+            self.get_logger().warn(f"Error processing input: {e}")
+            action = self._zero_action.copy()
+        
+        return action
 
     def _check_and_publish_trajectory_completion(self):
         """Check if trajectory has finished and robot has reached target position within tolerance."""

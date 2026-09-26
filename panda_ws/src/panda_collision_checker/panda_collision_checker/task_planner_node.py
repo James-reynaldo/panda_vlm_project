@@ -20,17 +20,17 @@ class TaskPlannerNode(Node):
     def __init__(self):
         super().__init__('task_planner_node')
         # Setup planner: offset=0.13 for approach position
-        self.setup_planner = TaskPlanner(grasp_offset=0.13)
+        self.setup_planner = TaskPlanner(grasp_offset=-0.13)
         # Grasp planner: offset=0 for actual grasp position
-        self.grasp_planner = TaskPlanner(grasp_offset=0.07)
+        self.grasp_planner = TaskPlanner(grasp_offset=-0.07)
         # Pre-place planner: approach the drawer with a 13 cm offset.
-        self.pre_place_planner = TaskPlanner(grasp_offset=0.13)
+        self.pre_place_planner = TaskPlanner(grasp_offset=-0.13)
         self.latest_cube_pose = None
         self.current_state = self.STATE_IDLE
         self.setup_pose = None
         self.grasp_pose = None
         # Target inside the lower drawer, expressed in the cube_pose/world frame.
-        self.lower_drawer_position = np.array([0.0, 0.1, 0.93])  # Adjusted to be above the drawer for placement
+        self.lower_drawer_position = np.array([0.0, 0.1, 0.93])
         self.pre_place_pose = None
         self.place_pose = None
         self.gripper_close_timer = None
@@ -84,7 +84,7 @@ class TaskPlannerNode(Node):
             cube_msg.pose.position.y,
             cube_msg.pose.position.z,
         ])
-        cube_ori = np.array([
+        cube_ori = np.array([ # In world frame, expressed as quaternion [x, y, z, w]
             cube_msg.pose.orientation.x,
             cube_msg.pose.orientation.y,
             cube_msg.pose.orientation.z,
@@ -92,7 +92,7 @@ class TaskPlannerNode(Node):
         ])
 
         # Generate setup pose using approach offset (0.13)
-        setup_position, setup_orientation = self.setup_planner.generate_grasp_pose(cube_pos, cube_ori)
+        setup_position, setup_orientation = self.setup_planner.generate_grasp_pose(cube_pos,cube_ori)
         self.setup_pose = (setup_position, setup_orientation)
 
         self._send_plan_request(self.setup_pose, "SETUP")
@@ -138,6 +138,7 @@ class TaskPlannerNode(Node):
             self.lower_drawer_position,
             self.grasp_pose[1],
         )
+        print(f"Pre-place pose: position={self.pre_place_pose[0]}, orientation={self.pre_place_pose[1]}")
         self._send_plan_request(self.pre_place_pose, "PRE_PLACE_IN_LOWER_DRAWER")
 
     def _request_place_motion(self):
@@ -147,11 +148,18 @@ class TaskPlannerNode(Node):
             self.current_state = self.STATE_IDLE
             return
 
+        if self.pre_place_pose is None:
+            self.get_logger().error("No pre-place pose is available; cannot request placement motion.")
+            self.current_state = self.STATE_IDLE
+            return
+
         self.current_state = self.STATE_WAITING_FOR_PLACE
 
-        # Keep the end-effector orientation used to grasp the cube while
-        # descending from the pre-place pose to the lower-drawer target.
-        self.place_pose = (self.lower_drawer_position, self.grasp_pose[1])
+        # Keep the approach orientation established during pre-place. Reusing the
+        # grasp-frame quaternion here makes the planner rotate the wrist during
+        # the final translation into the drawer instead of moving forward.
+        self.place_pose = (self.lower_drawer_position, self.pre_place_pose[1])
+        print(f"Place pose: position={self.place_pose[0]}, orientation={self.place_pose[1]}")
         self._send_plan_request(self.place_pose, "PLACE_IN_LOWER_DRAWER")
 
     def _close_gripper_then_request_pre_place(self):

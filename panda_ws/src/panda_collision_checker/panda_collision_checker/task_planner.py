@@ -58,12 +58,20 @@ class TaskPlanner:
 
         # Orientation facing front of cube
         cube_rotation = Rotation.from_quat(cube_orientation)
-        side_rotation = Rotation.from_euler("xyz", [0, np.pi / 2, np.pi / 2])
+        side_rotation = Rotation.from_euler("xyz", [0, -np.pi / 2,np.pi / 2])
+        # side_rotation = Rotation.from_euler("xyz", [0, 0, -np.deg2rad(90)])  # Adjusted for top-down grasp
         desired_rotation = cube_rotation * side_rotation
         desired_orientation = desired_rotation.as_quat()
+        # Canonicalize quaternion sign to avoid equivalent orientations with
+        # opposite signs selecting the long angular path during interpolation.
+        if desired_orientation[3] < 0.0:
+            desired_orientation = -desired_orientation
+        print("Desired orientation (quaternion):", desired_orientation)
         # Position above the cube
         grasp_offset = np.array([0.0, 0.0, self.grasp_offset])
         grasp_position = (cube_position + desired_rotation.apply(grasp_offset))
+        print("Cube position:", cube_position)
+        print("Grasp position:", grasp_position)
 
 
         # # TODO: verify Panda gripper orientation convention
@@ -96,5 +104,8 @@ class TaskPlanner:
         target_rotation = Rotation.from_quat(target_orientation)
         approach_offset = np.array([0.0, 0.0, self.grasp_offset])
         approach_position = target_position + target_rotation.apply(approach_offset)
+
+        if target_orientation[3] < 0.0:
+            target_orientation = -target_orientation
 
         return approach_position, target_orientation.copy()
