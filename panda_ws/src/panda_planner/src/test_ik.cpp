@@ -97,7 +97,7 @@ int main()
     // ============================================================
 
     Eigen::Vector3d grasp_position_world(
-        0.0,  0.05,   0.9
+        0.0,  0.1,   1.05
     );
     // Eigen::Vector3d grasp_position_world(
     //     0.0,
@@ -106,7 +106,6 @@ int main()
     // );
 
     // ROS quaternion is [x, y, z, w]
-    //
     // Eigen::Quaterniond constructor is (w, x, y, z)
 
     // Eigen::Quaterniond grasp_orientation_world(
@@ -117,7 +116,7 @@ int main()
     // );
 
     Eigen::Quaterniond grasp_orientation_world(
-        0.5, -0.5,  0.5,  0.5       
+        -0.5, 0.5,  0.5,  0.5       
     );
     // ============================================================
     // 2. PANDA BASE POSE FROM MUJOCO

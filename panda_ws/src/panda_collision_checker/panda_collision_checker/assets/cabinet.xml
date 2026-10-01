@@ -61,7 +61,7 @@
                     name="shelf_1"
                     type="box"
                     size="0.15 0.135 0.012"
-                    pos="0 0 0.165"
+                    pos="0 0 0.155"
                     material="brown_wood"
                     group="0"/>
 

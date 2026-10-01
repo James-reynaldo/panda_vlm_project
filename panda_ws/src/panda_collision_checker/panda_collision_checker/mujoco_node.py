@@ -26,6 +26,18 @@ class MujocoNode(Node):
         # Declare and get control mode parameter
         self.declare_parameter('control_mode', 'planner')  # 'planner' or 'manual'
         self.control_mode = self.get_parameter('control_mode').value
+        # Optional: starting joint positions for manual mode (list of 7 floats)
+        self.manual_start_positions = np.asarray([
+            0.9051703886252025,
+            1.2204282509234898,
+            -0.4194572151022374,
+            -1.8351950762934068,
+            -2.3292482242329973,
+            1.959637702580288,
+            1.002957050746871
+
+        ])
+
         self.get_logger().info(f"Control mode: {self.control_mode}")
 
         # Manual input needs a controller supported by robosuite input2action.
@@ -45,7 +57,63 @@ class MujocoNode(Node):
             use_camera_obs=False,
             controller_configs=controller_configs,
         )
+        # Initialize environment
         self.env.reset()
+
+        # Apply manual start positions AFTER reset so they are not overwritten
+        if self.control_mode == 'manual' and self.manual_start_positions is not None:
+            try:
+                start = np.asarray(self.manual_start_positions, dtype=np.float64)
+                if start.size == 7:
+                    self.get_logger().info(f"Applying manual start joint positions: {start.tolist()}")
+                    try:
+                        # Set simulator qpos directly and update internal state
+                        self.env.sim.data.qpos[:7] = start
+                        try:
+                            self.env.robots[0]._joint_positions = start.copy()
+                        except Exception:
+                            pass
+                        # Update controller initial joints if supported
+                        try:
+                            self.env.robots[0].controller.update_initial_joints(start)
+                        except Exception:
+                            pass
+                        # Forward the simulator to apply changes
+                        self.env.sim.forward()
+                    except Exception as e:
+                        self.get_logger().warn(f"Failed to apply manual start positions: {e}")
+                else:
+                    self.get_logger().warn(
+                        f"manual_start_positions must have 7 elements, got {start.size}"
+                    )
+            except Exception as e:
+                self.get_logger().warn(f"Error processing manual_start_positions: {e}")
+
+        # # If manual control was requested and a start joint position list was provided,
+        # # set the robot to that joint configuration immediately so manual control
+        # # begins from the requested pose.
+        # try:
+        #     if self.control_mode == 'manual' and self.manual_start_positions:
+        #         start = np.asarray(self.manual_start_positions, dtype=np.float64)
+        #         if start.size == 7:
+        #             # Set the first 7 qpos entries (assumed joint qpos) and forward the sim
+        #             self.get_logger().info(f"Applying manual start joint positions: {start.tolist()}")
+        #             try:
+        #                 self.env.sim.data.qpos[:7] = start
+        #                 # Update robosuite internal state if available
+        #                 try:
+        #                     self.env.robots[0]._joint_positions = start.copy()
+        #                 except Exception:
+        #                     pass
+        #                 self.env.sim.forward()
+        #             except Exception as e:
+        #                 self.get_logger().warn(f"Failed to apply manual start positions: {e}")
+        #         else:
+        #             self.get_logger().warn(
+        #                 f"Parameter 'manual_start_positions' must have 7 elements, got {start.size}"
+        #             )
+        # except Exception as e:
+        #     self.get_logger().warn(f"Error processing manual_start_positions parameter: {e}")
 
         self.cube_id = self.env.sim.model.body_name2id("red_cube_main")
         self._zero_action = np.zeros(self.env.action_dim, dtype=np.float64)
@@ -93,13 +161,34 @@ class MujocoNode(Node):
             quat_wxyz[0]
         ])
 
-        self.get_logger().info(
-            f"Gripper quaternion (xyzw): "
-            f"[{quat_xyzw[0]:.6f}, "
-            f"{quat_xyzw[1]:.6f}, "
-            f"{quat_xyzw[2]:.6f}, "
-            f"{quat_xyzw[3]:.6f}]"
-        )
+        # Get current joint positions (first 7 qpos assumed joints)
+        try:
+            joint_positions = np.asarray(self.env.sim.data.qpos[:7], dtype=np.float64)
+        except Exception:
+            joint_positions = None
+
+        # Get gripper position in world frame (body_xpos)
+        try:
+            gripper_pos = np.asarray(self.env.sim.data.body_xpos[gripper_id], dtype=np.float64)
+        except Exception:
+            gripper_pos = None
+
+        # Log orientation, joint positions, and gripper world position
+        msg_lines = [
+            f"Gripper quaternion (xyzw): [{quat_xyzw[0]:.6f}, {quat_xyzw[1]:.6f}, {quat_xyzw[2]:.6f}, {quat_xyzw[3]:.6f}]"
+        ]
+
+        if joint_positions is not None:
+            msg_lines.append(f"Joint positions: [{', '.join(f'{x:.6f}' for x in joint_positions)}]")
+        else:
+            msg_lines.append("Joint positions: <unavailable>")
+
+        if gripper_pos is not None:
+            msg_lines.append(f"Gripper position (world): [{gripper_pos[0]:.6f}, {gripper_pos[1]:.6f}, {gripper_pos[2]:.6f}]")
+        else:
+            msg_lines.append("Gripper position (world): <unavailable>")
+
+        self.get_logger().info(" | ".join(msg_lines))
         
     def _get_param_or_default(self, name, default):
         """Get parameter value, or return default if not set."""

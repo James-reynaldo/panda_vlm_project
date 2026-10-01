@@ -3,6 +3,7 @@ import numpy as np
 
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
 from std_msgs.msg import Bool
 from panda_interfaces.srv import PlanMotion
 from .task_planner import TaskPlanner
@@ -15,25 +16,32 @@ class TaskPlannerNode(Node):
     STATE_WAITING_FOR_GRIPPER_CLOSE = 3
     STATE_WAITING_FOR_PRE_PLACE = 4
     STATE_WAITING_FOR_PLACE = 5
-    STATE_DONE = 6
+    STATE_WAITING_FOR_IDLE = 6
+    STATE_DONE = 7
 
     def __init__(self):
         super().__init__('task_planner_node')
         # Setup planner: offset=0.13 for approach position
         self.setup_planner = TaskPlanner(grasp_offset=-0.13)
         # Grasp planner: offset=0 for actual grasp position
-        self.grasp_planner = TaskPlanner(grasp_offset=-0.07)
+        self.grasp_planner = TaskPlanner(grasp_offset=-0.09)
         # Pre-place planner: approach the drawer with a 13 cm offset.
         self.pre_place_planner = TaskPlanner(grasp_offset=-0.13)
+
+        self.idle_position = np.array([-0.1, -0.15, 0.86]) 
+        
         self.latest_cube_pose = None
         self.current_state = self.STATE_IDLE
         self.setup_pose = None
         self.grasp_pose = None
         # Target inside the lower drawer, expressed in the cube_pose/world frame.
+        self.target_drawer_position = None
         self.lower_drawer_position = np.array([0.0, 0.1, 0.93])  # Adjusted to be above the drawer for placement
+        self.upper_drawer_position = np.array([0.0, 0.1, 1.07])  # Adjusted to be above the drawer for placement
         self.pre_place_pose = None
         self.place_pose = None
         self.gripper_close_timer = None
+        self.pending_setup_restart = False
 
 
         self.pose_subscription = self.create_subscription(
@@ -43,6 +51,12 @@ class TaskPlannerNode(Node):
             10
         )
 
+        self.drawer_target_subscription = self.create_subscription(
+            String,
+            '/drawer_target',
+            self.drawer_target_callback,
+            10
+        )
         self.plan_motion_client = self.create_client(PlanMotion, '/plan_motion')
         
         # Subscribe to motion completion signal
@@ -58,6 +72,29 @@ class TaskPlannerNode(Node):
         self.setup_timer = self.create_timer(2.0, self._request_setup_motion)
         self.get_logger().info("Task Planner Node initialized. Waiting for cube pose to request setup motion.")
 
+    def drawer_target_callback(self, msg):
+        """Handle drawer target messages to determine which drawer to place the cube in."""
+        if msg.data == "lower":
+            self.target_drawer_position = self.lower_drawer_position
+            self.get_logger().info("Drawer target set to LOWER drawer.")
+        elif msg.data == "upper":
+            self.target_drawer_position = self.upper_drawer_position
+            self.get_logger().info("Drawer target set to UPPER drawer.")
+        else:
+            self.get_logger().warn(f"Received unknown drawer target: {msg.data}. Ignoring.")
+            return
+
+        if self.current_state == self.STATE_IDLE or self.current_state == self.STATE_DONE:
+            self.get_logger().info("New drawer target received; starting setup motion.")
+            self.current_state = self.STATE_IDLE
+            self.pending_setup_restart = False
+            self._request_setup_motion()
+        else:
+            self.pending_setup_restart = True
+            self.get_logger().info(
+                f"New drawer target received while a motion sequence is active; will restart setup after completion."
+            )
+
     def cube_pose_callback(self, msg):
         # Store the latest cube pose for use when generating motion plans
         self.latest_cube_pose = msg
@@ -70,6 +107,10 @@ class TaskPlannerNode(Node):
         """Request motion to setup/pre-grasp pose."""
         if self.latest_cube_pose is None:
             self.get_logger().warn("No cube pose available yet; waiting for cube_pose message.")
+            return
+
+        if self.target_drawer_position is None:
+            self.get_logger().warn("No drawer target defined yet; waiting before requesting setup motion.")
             return
 
         if self.current_state != self.STATE_IDLE:
@@ -135,7 +176,7 @@ class TaskPlannerNode(Node):
         self.current_state = self.STATE_WAITING_FOR_PRE_PLACE
 
         self.pre_place_pose = self.pre_place_planner.generate_approach_pose(
-            self.lower_drawer_position,
+            self.target_drawer_position,
             self.grasp_pose[1],
         )
         self._send_plan_request(self.pre_place_pose, "PRE_PLACE_IN_LOWER_DRAWER")
@@ -151,8 +192,20 @@ class TaskPlannerNode(Node):
 
         # Keep the end-effector orientation used to grasp the cube while
         # descending from the pre-place pose to the lower-drawer target.
-        self.place_pose = (self.lower_drawer_position, self.grasp_pose[1])
+        self.place_pose = (self.target_drawer_position, self.grasp_pose[1])
         self._send_plan_request(self.place_pose, "PLACE_IN_LOWER_DRAWER")
+
+    def _request_idle_motion(self):
+        """Request motion to the idle pose while keeping the current orientation."""
+        if self.grasp_pose is None:
+            self.get_logger().error("No grasp pose is available; cannot request idle motion.")
+            self.current_state = self.STATE_IDLE
+            return
+
+        self.current_state = self.STATE_WAITING_FOR_IDLE
+
+        idle_pose = (self.idle_position, self.grasp_pose[1])
+        self._send_plan_request(idle_pose, "IDLE")
 
     def _close_gripper_then_request_pre_place(self):
         """Give the gripper command one control cycle before transporting the cube."""
@@ -213,7 +266,15 @@ class TaskPlannerNode(Node):
         elif self.current_state == self.STATE_WAITING_FOR_PLACE:
             self.get_logger().info("Lower-drawer placement motion completed. Opening gripper.")
             self.gripper_command_publisher.publish(Bool(data=False))  # Release the cube
+            self._request_idle_motion()
+        elif self.current_state == self.STATE_WAITING_FOR_IDLE:
+            self.get_logger().info("Idle motion completed.")
             self.current_state = self.STATE_DONE
+            if self.pending_setup_restart and self.target_drawer_position is not None:
+                self.get_logger().info("Pending drawer target restart detected; starting setup motion again.")
+                self.pending_setup_restart = False
+                self.current_state = self.STATE_IDLE
+                self._request_setup_motion()
         else:
             # Ignore completion signals if not waiting for motion
             self.get_logger().debug(f"Received /motion_completed but not waiting for motion (state={self.current_state})")
@@ -237,6 +298,7 @@ class TaskPlannerNode(Node):
         else:
             self.get_logger().warn(f"{motion_type} motion plan failed; resetting to idle state.")
             self.current_state = self.STATE_IDLE
+            self.pending_setup_restart = False
 
 def main(args=None):
 
