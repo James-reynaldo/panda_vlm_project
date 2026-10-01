@@ -6,6 +6,7 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from std_msgs.msg import Bool
 from panda_interfaces.srv import PlanMotion
+from panda_interfaces.srv import SetRedCubeCollisionEnabled
 from .task_planner import TaskPlanner
 
 class TaskPlannerNode(Node):
@@ -24,7 +25,7 @@ class TaskPlannerNode(Node):
         # Setup planner: offset=0.13 for approach position
         self.setup_planner = TaskPlanner(grasp_offset=-0.13)
         # Grasp planner: offset=0 for actual grasp position
-        self.grasp_planner = TaskPlanner(grasp_offset=-0.09)
+        self.grasp_planner = TaskPlanner(grasp_offset=-0.08)
         # Pre-place planner: approach the drawer with a 13 cm offset.
         self.pre_place_planner = TaskPlanner(grasp_offset=-0.13)
 
@@ -58,6 +59,13 @@ class TaskPlannerNode(Node):
             10
         )
         self.plan_motion_client = self.create_client(PlanMotion, '/plan_motion')
+        self.red_cube_collision_client = self.create_client(
+            SetRedCubeCollisionEnabled,
+            '/set_red_cube_collision_enabled'
+        )
+
+        if not self.red_cube_collision_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().warn("/set_red_cube_collision_enabled service not available yet; red-cube gating will be skipped until it appears.")
         
         # Subscribe to motion completion signal
         self.motion_completed_subscription = self.create_subscription(
@@ -103,6 +111,33 @@ class TaskPlannerNode(Node):
             f"position=({msg.pose.position.x}, {msg.pose.position.y}, {msg.pose.position.z})"
         )
 
+    def _set_red_cube_collision_enabled(self, enabled):
+        if not self.red_cube_collision_client.service_is_ready():
+            self.get_logger().warn("/set_red_cube_collision_enabled service is not ready; skipping red-cube collision update.")
+            return False
+
+        request = SetRedCubeCollisionEnabled.Request()
+        request.enabled = bool(enabled)
+        future = self.red_cube_collision_client.call_async(request)
+        try:
+            rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        except Exception as exc:
+            self.get_logger().error(f"/set_red_cube_collision_enabled service call failed: {exc}")
+            return False
+
+        if not future.done():
+            self.get_logger().warn("/set_red_cube_collision_enabled service call timed out.")
+            return False
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"/set_red_cube_collision_enabled service call failed: {exc}")
+            return False
+
+        self.get_logger().info(response.message)
+        return bool(response.success)
+
     def _request_setup_motion(self):
         """Request motion to setup/pre-grasp pose."""
         if self.latest_cube_pose is None:
@@ -117,6 +152,7 @@ class TaskPlannerNode(Node):
             # Timer is no longer needed; cancel it
             return
 
+        self._set_red_cube_collision_enabled(True)
         self.current_state = self.STATE_WAITING_FOR_SETUP
         
         cube_msg = self.latest_cube_pose
@@ -249,7 +285,8 @@ class TaskPlannerNode(Node):
             return  # Ignore False messages
 
         if self.current_state == self.STATE_WAITING_FOR_SETUP:
-            self.get_logger().info("Setup motion completed. Requesting grasp motion.")
+            self.get_logger().info("Setup motion completed. Disabling red-cube collisions for grasp motion.")
+            self._set_red_cube_collision_enabled(False)
             self._request_grasp_motion()
         elif self.current_state == self.STATE_WAITING_FOR_GRASP:
             self.get_logger().info("Grasp motion completed. Closing gripper.")
@@ -266,6 +303,8 @@ class TaskPlannerNode(Node):
         elif self.current_state == self.STATE_WAITING_FOR_PLACE:
             self.get_logger().info("Lower-drawer placement motion completed. Opening gripper.")
             self.gripper_command_publisher.publish(Bool(data=False))  # Release the cube
+            self._set_red_cube_collision_enabled(True)
+            self.get_logger().info("Red-cube collisions re-enabled before returning to idle motion.")
             self._request_idle_motion()
         elif self.current_state == self.STATE_WAITING_FOR_IDLE:
             self.get_logger().info("Idle motion completed.")
@@ -274,6 +313,7 @@ class TaskPlannerNode(Node):
                 self.get_logger().info("Pending drawer target restart detected; starting setup motion again.")
                 self.pending_setup_restart = False
                 self.current_state = self.STATE_IDLE
+                self._set_red_cube_collision_enabled(True)
                 self._request_setup_motion()
         else:
             # Ignore completion signals if not waiting for motion

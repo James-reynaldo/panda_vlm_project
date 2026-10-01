@@ -15,6 +15,7 @@ find_package(trajectory_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/CollisionCheck.srv"
+  "srv/SetRedCubeCollisionEnabled.srv"
   "srv/PlanMotion.srv"
   DEPENDENCIES geometry_msgs trajectory_msgs
 )

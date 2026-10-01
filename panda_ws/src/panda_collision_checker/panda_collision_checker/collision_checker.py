@@ -21,6 +21,20 @@ class CollisionChecker:
         "gripper0_finger2_pad_collision",
     }
 
+    ROBOT_HAND_BODIES = {
+        "robot0_right_hand",
+        "gripper0_right_gripper",
+        "gripper0_eef",
+        "gripper0_leftfinger",
+        "gripper0_finger_joint1_tip",
+        "gripper0_rightfinger",
+        "gripper0_finger_joint2_tip",
+    }
+
+    CUBE_BODIES = {
+        "red_cube_main",
+    }
+
     TABLE_GEOMS = {
         "table_collision",
     }
@@ -37,7 +51,18 @@ class CollisionChecker:
     def __init__(self, env):
         self.env = env
 
-    def check_configuration(self, joint_positions):
+    def _geom_body_name(self, geom_id):
+        body_id = self.env.sim.model.geom_bodyid[geom_id]
+        return self.env.sim.model.body_id2name(body_id)
+
+    def _has_hand_cube_contact(self, geom1_name, geom2_name):
+        return (
+            (geom1_name in self.ROBOT_HAND_BODIES and geom2_name in self.CUBE_BODIES)
+            or
+            (geom2_name in self.ROBOT_HAND_BODIES and geom1_name in self.CUBE_BODIES)
+        )
+
+    def check_configuration(self, joint_positions, red_cube_collision_enabled=True):
 
         joint_positions = np.asarray(
             joint_positions,
@@ -63,19 +88,11 @@ class CollisionChecker:
 
             contact = self.env.sim.data.contact[i]
 
-            name1 = self.env.sim.model.geom(contact.geom1).name
-            name2 = self.env.sim.model.geom(contact.geom2).name
-            
+            geom1_name = self._geom_body_name(contact.geom1)
+            geom2_name = self._geom_body_name(contact.geom2)
 
-            # print(f"Contact: {name1} <-> {name2}")
-
-            geom1_name = self.env.sim.model.geom(
-                contact.geom1
-            ).name
-
-            geom2_name = self.env.sim.model.geom(
-                contact.geom2
-            ).name
+            if red_cube_collision_enabled and self._has_hand_cube_contact(geom1_name, geom2_name):
+                return True
 
             # Panda <-> table
             if (

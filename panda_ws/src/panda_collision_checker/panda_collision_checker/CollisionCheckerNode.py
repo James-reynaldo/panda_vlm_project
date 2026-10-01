@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 
 from panda_interfaces.srv import CollisionCheck
+from panda_interfaces.srv import SetRedCubeCollisionEnabled
 
 from .Panda_scene import PandaScene
 from .collision_checker import CollisionChecker
@@ -19,7 +20,10 @@ class CollisionCheckerNode(Node):
 
         self.env.reset()
 
+        self.red_cube = self.env.model.mujoco_objects[0]
+
         self.checker = CollisionChecker(self.env)
+        self.red_cube_collision_enabled = True
 
         self.service = self.create_service(
             CollisionCheck,
@@ -27,18 +31,34 @@ class CollisionCheckerNode(Node):
             self.check_collision,
         )
 
+        self.red_cube_collision_service = self.create_service(
+            SetRedCubeCollisionEnabled,
+            "/set_red_cube_collision_enabled",
+            self.set_red_cube_collision_enabled,
+        )
+
         self.get_logger().info(
             "Collision checker ready."
         )
 
     def check_collision(self, request, response):
-
         collision = self.checker.check_configuration(
-            request.joint_positions
+            request.joint_positions,
+            red_cube_collision_enabled=self.red_cube_collision_enabled,
         )
 
         response.collision_free = not collision
 
+        return response
+
+    def set_red_cube_collision_enabled(self, request, response):
+        self.red_cube_collision_enabled = bool(request.enabled)
+        response.success = True
+        response.message = (
+            "Red-cube collisions enabled." if self.red_cube_collision_enabled
+            else "Red-cube collisions disabled."
+        )
+        self.get_logger().info(response.message)
         return response
 
 
