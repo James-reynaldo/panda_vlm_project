@@ -67,7 +67,7 @@ class CollisionChecker:
             name2 = self.env.sim.model.geom(contact.geom2).name
             
 
-            print(f"Contact: {name1} <-> {name2}")
+            # print(f"Contact: {name1} <-> {name2}")
 
             geom1_name = self.env.sim.model.geom(
                 contact.geom1
@@ -89,10 +89,10 @@ class CollisionChecker:
                     and geom1_name in self.TABLE_GEOMS
                 )
             ):
-                print(
-                    f"Collision: "
-                    f"{geom1_name} <-> {geom2_name}"
-                )
+                # print(
+                #     f"Collision: "
+                #     f"{geom1_name} <-> {geom2_name}"
+                # )
                 return True
 
             # Panda <-> cabinet
@@ -107,10 +107,10 @@ class CollisionChecker:
                     and geom1_name in self.CABINET_GEOMS
                 )
             ):
-                print(
-                    f"Collision: "
-                    f"{geom1_name} <-> {geom2_name}"
-                )
+                # print(
+                #     f"Collision: "
+                #     f"{geom1_name} <-> {geom2_name}"
+                # )
                 return True
-        print("No collision detected.")
+        # print("No collision detected.")
         return False

@@ -332,8 +332,8 @@ public:
         try {
             auto response = future.get();
             if (!response->collision_free) {
-                RCLCPP_WARN(this->get_logger(), "Collision detected for q = [%f, %f, %f, %f, %f, %f, %f]",
-                            q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
+                // RCLCPP_WARN(this->get_logger(), "Collision detected for q = [%f, %f, %f, %f, %f, %f, %f]",
+                //             q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
                 return false;
             }
 
@@ -372,6 +372,9 @@ public:
             return this->checkCollision(q);
         });
 
+        //Finer resolution for state validity checking to avoid missing collisions
+        ss.getSpaceInformation()->setStateValidityCheckingResolution(0.01); // 1% of the space's maximum extent
+
         ompl::base::ScopedState<ompl::base::RealVectorStateSpace> start(space);
         for (std::size_t i = 0; i < 7; ++i)
         {
@@ -401,7 +404,7 @@ public:
         }
 
         ompl::geometric::PathGeometric path = ss.getSolutionPath();
-        path.interpolate();
+        // path.interpolate();
 
         // Log path statistics before simplification
         size_t states_before = path.getStateCount();
@@ -468,7 +471,7 @@ private:
                         grasp_pose.pose.orientation.x, grasp_pose.pose.orientation.y, grasp_pose.pose.orientation.z, grasp_pose.pose.orientation.w);
 
             Eigen::Vector3d pos_world(grasp_pose.pose.position.x, grasp_pose.pose.position.y, grasp_pose.pose.position.z);
-            Eigen::Quaterniond ori_world(grasp_pose.pose.orientation.x, grasp_pose.pose.orientation.y, grasp_pose.pose.orientation.z, grasp_pose.pose.orientation.w);
+            Eigen::Quaterniond ori_world(grasp_pose.pose.orientation.w, grasp_pose.pose.orientation.x, grasp_pose.pose.orientation.y, grasp_pose.pose.orientation.z);
 
             Eigen::Isometry3d T_base_grasp = transformToPandaBase(
                 pos_world,
@@ -488,8 +491,8 @@ private:
             }
 
             const auto& candidate = q_solution[0];
-            RCLCPP_INFO(this->get_logger(), "IK solution found: [%f, %f, %f, %f, %f, %f, %f]",
-                        candidate[0], candidate[1], candidate[2], candidate[3], candidate[4], candidate[5], candidate[6]);
+            // RCLCPP_INFO(this->get_logger(), "IK solution found: [%f, %f, %f, %f, %f, %f, %f]",
+            //             candidate[0], candidate[1], candidate[2], candidate[3], candidate[4], candidate[5], candidate[6]);
 
             if (!checkCollision(candidate))
             {

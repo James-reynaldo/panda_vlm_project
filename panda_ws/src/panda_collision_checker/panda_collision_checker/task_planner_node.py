@@ -20,11 +20,11 @@ class TaskPlannerNode(Node):
     def __init__(self):
         super().__init__('task_planner_node')
         # Setup planner: offset=0.13 for approach position
-        self.setup_planner = TaskPlanner(grasp_offset=0.13)
+        self.setup_planner = TaskPlanner(grasp_offset=-0.13)
         # Grasp planner: offset=0 for actual grasp position
-        self.grasp_planner = TaskPlanner(grasp_offset=0.07)
+        self.grasp_planner = TaskPlanner(grasp_offset=-0.07)
         # Pre-place planner: approach the drawer with a 13 cm offset.
-        self.pre_place_planner = TaskPlanner(grasp_offset=0.13)
+        self.pre_place_planner = TaskPlanner(grasp_offset=-0.13)
         self.latest_cube_pose = None
         self.current_state = self.STATE_IDLE
         self.setup_pose = None
